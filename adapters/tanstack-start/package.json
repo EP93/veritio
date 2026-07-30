@@ -2,6 +2,7 @@
   "name": "@veritio/tanstack-start",
   "version": "0.0.2",
   "description": "TanStack Start adapter for recording Veritio audit trail evidence from server functions and route handlers.",
+  "homepage": "https://getveritio.com",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

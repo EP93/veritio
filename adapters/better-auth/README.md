@@ -1,5 +1,7 @@
 # `@veritio/better-auth`
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Better Auth adapter for emitting Veritio events for auth lifecycle activity.
 
 The adapter is a thin mapper. Host applications own Better Auth configuration,

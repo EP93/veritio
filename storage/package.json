@@ -2,6 +2,7 @@
   "name": "@veritio/storage",
   "version": "0.4.3",
   "description": "Host-injected storage adapters for Veritio audit trail evidence.",
+  "homepage": "https://getveritio.com",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

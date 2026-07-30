@@ -1,5 +1,7 @@
 # @veritio/core
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Protocol-first TypeScript SDK for Veritio audit trail and evidence graph records.
 
 ## Install

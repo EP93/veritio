@@ -1,5 +1,7 @@
 # @veritio/claude-code
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Capture [Claude Code](https://code.claude.com) agent activity as Veritio evidence —
 passively, via hooks — and query it back through an MCP server.
 

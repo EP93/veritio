@@ -1,5 +1,7 @@
 # `@veritio/tanstack-start`
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Thin TanStack Start adapter for recording route-handler and server-function
 evidence through a host-configured Veritio recorder.
 

@@ -1,5 +1,7 @@
 # `@veritio/storage`
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Host-injected storage helpers for Veritio audit trail evidence.
 
 The package provides durable `AuditStore` factories for transaction-capable SQL
