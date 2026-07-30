@@ -27,6 +27,27 @@ It must remain useful without a Veritio Cloud account.
 - `.agents/`, `.codex/agents/`, `.claude/`: local agent configuration and
   project-scoped review helpers.
 
+## Repository Layout
+
+```txt
+spec/                 Language-neutral event, edge, and record schemas
+sdks/typescript/      TypeScript SDK
+sdks/python/          Python SDK
+sdks/go/              Go SDK
+storage/              Host-injected storage adapters and local file store
+adapters/             Framework, auth, UI-intent, and agent adapters
+server/node/          Private local/self-hosted Node server module
+gateway/              Self-hosted AI governance gateway (experimental)
+cli/                  Local Workbench and MCP CLI
+docs/                 OSS architecture, routing, AI integration, and release docs
+examples/             Runnable public examples
+scripts/              Verification and split-repo orchestration scripts
+.agents/              Local Codex-style skills
+.codex/               Codex agent and hook configuration
+.claude/              Claude Code rules, agents, skills, and hooks
+.github/              GitHub workflow configuration
+```
+
 ## Does Not Own
 
 - Public website implementation, SEO pages, marketing assets, or website docs
