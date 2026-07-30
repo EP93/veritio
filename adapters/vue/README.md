@@ -1,5 +1,7 @@
 # `@veritio/vue`
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Browser-safe Vue helpers for annotating UI elements with inert Veritio
 evidence-intent attrs (`data-veritio-action`, `data-veritio-target-type`,
 `data-veritio-target-id`, `data-veritio-purpose`).

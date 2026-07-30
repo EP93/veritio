@@ -2,6 +2,8 @@
 
 [English](README.md) | [한국어](README.ko.md) | **简体中文**
 
+[getveritio.com](https://getveritio.com) · [文档](https://getveritio.com/docs/) · [Veritio Cloud](https://getveritio.com/cloud/)
+
 > 本文档是英文 [README](README.md) 的摘要翻译。如内容有出入，以英文文档为准；
 > 协议与包的详细信息请参阅英文文档。
 

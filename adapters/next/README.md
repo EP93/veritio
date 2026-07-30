@@ -1,5 +1,7 @@
 # `@veritio/next`
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Thin Next.js adapter for recording route-handler and server-action evidence
 through a host-configured Veritio recorder.
 

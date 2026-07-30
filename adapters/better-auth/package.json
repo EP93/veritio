@@ -2,6 +2,7 @@
   "name": "@veritio/better-auth",
   "version": "0.0.2",
   "description": "Better Auth adapter for recording Veritio audit trail evidence from server-side auth lifecycle events.",
+  "homepage": "https://getveritio.com",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

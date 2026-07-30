@@ -2,6 +2,7 @@
   "name": "@veritio/svelte",
   "version": "0.0.2",
   "description": "Svelte helpers for annotating UI with Veritio evidence intents without client-side recording.",
+  "homepage": "https://getveritio.com",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

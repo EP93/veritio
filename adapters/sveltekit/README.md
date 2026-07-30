@@ -1,5 +1,7 @@
 # `@veritio/sveltekit`
 
+Part of [Veritio](https://getveritio.com), the open-source evidence layer — see the [docs](https://getveritio.com/docs/) and [Veritio Cloud](https://getveritio.com/cloud/).
+
 Thin SvelteKit adapter for recording form-action and endpoint evidence through
 a host-configured Veritio recorder.
 
