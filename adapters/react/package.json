@@ -1,6 +1,6 @@
 {
   "name": "@veritio/react",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "React helpers for annotating UI with Veritio evidence intents without client-side recording.",
   "homepage": "https://getveritio.com",
   "license": "Apache-2.0",

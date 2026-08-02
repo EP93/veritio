@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
 # Publishes the release trio — @veritio/core, @veritio/storage,
-# @veritio/claude-code — in dependency order. Run AFTER the release commit
-# (version bumps + exact claude-code pins + bun.lock + CHANGELOG) is merged.
+# @veritio/claude-code — in dependency order, then the published framework
+# adapters. Run AFTER the release commit (version bumps + exact claude-code
+# pins + bun.lock + CHANGELOG) is merged. Already-published versions are
+# skipped, so trio-only or adapter-only releases run through the same script.
 #
 # Requires NPM_TOKEN: a SHORT-LIVED npm automation token supplied by the
 # operator at run time. It is passed to bun via NPM_CONFIG_TOKEN only for the
@@ -21,7 +23,9 @@ cd "$(git rev-parse --show-toplevel)"
 echo "release-npm: running the full verify gate first" >&2
 bun run verify
 
-for pkg in sdks/typescript storage adapters/claude-code; do
+for pkg in sdks/typescript storage adapters/claude-code \
+  adapters/better-auth adapters/next adapters/tanstack-start \
+  adapters/sveltekit adapters/react adapters/vue adapters/svelte; do
   name="$(node -p "require('./${pkg}/package.json').name")"
   version="$(node -p "require('./${pkg}/package.json').version")"
   # Partial releases are normal (an adapter-only bump keeps core/storage at
@@ -36,6 +40,7 @@ for pkg in sdks/typescript storage adapters/claude-code; do
 done
 
 echo "release-npm: verifying the registry sees the new versions" >&2
-for name in core storage claude-code; do
+for name in core storage claude-code better-auth next tanstack-start \
+  sveltekit react vue svelte; do
   echo "@veritio/${name}: $(npm view "@veritio/${name}" version)"
 done
