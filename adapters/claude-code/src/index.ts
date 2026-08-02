@@ -11,5 +11,6 @@ export * from "./ingest.js";
 export * from "./map.js";
 export * from "./query.js";
 export * from "./redact.js";
+export * from "./spool.js";
 export * from "./state.js";
 export type { HookPayload, SessionContext } from "./types.js";

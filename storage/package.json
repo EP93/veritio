@@ -42,7 +42,8 @@
     "build": "bun run --cwd ../sdks/typescript build && node ../node_modules/typescript/bin/tsc -p tsconfig.build.json",
     "typecheck": "bun run --cwd ../sdks/typescript build && node ../node_modules/typescript/bin/tsc -p tsconfig.build.json --noEmit",
     "test": "bun run --cwd ../sdks/typescript build && bun test src integration",
-    "db:up": "docker compose -f docker-compose.yml up -d --wait",
+    "test:stress": "bun run --cwd ../sdks/typescript build && bun test stress --timeout 60000",
+    "db:up": "docker compose -f docker-compose.yml up -d --wait postgres mysql mariadb mongo minio clickhouse && docker compose -f docker-compose.yml run --rm minio-init",
     "db:down": "docker compose -f docker-compose.yml down -v",
     "test:live": "VERITIO_POSTGRES_TEST_URL=postgresql://veritio:veritio@127.0.0.1:54391/veritio VERITIO_NEON_TEST_URL=postgresql://veritio:veritio@127.0.0.1:54391/veritio VERITIO_MYSQL_TEST_URL=mysql://root:veritio@127.0.0.1:33061/veritio VERITIO_MARIADB_TEST_URL=mysql://root:veritio@127.0.0.1:33071/veritio VERITIO_MONGODB_TEST_URL='mongodb://127.0.0.1:27021/veritio?replicaSet=rs0' VERITIO_S3_TEST_ENDPOINT=http://127.0.0.1:39000 VERITIO_S3_TEST_ACCESS_KEY_ID=veritio VERITIO_S3_TEST_SECRET_ACCESS_KEY=veritio-local VERITIO_S3_TEST_BUCKET=veritio-archive VERITIO_CLICKHOUSE_TEST_ENDPOINT=http://127.0.0.1:38123 bun run test"
   },

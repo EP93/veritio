@@ -5,13 +5,13 @@ import { buildFullGovernanceScenario } from "./scenario";
  * Cloud project. Secrets stay in environment variables and are never logged.
  */
 async function main() {
-  const baseUrl = readEnv("VERITIO_CLOUD_BASE_URL", "https://console.getveritio.com");
+  const baseUrl = readEnv("VERITIO_CLOUD_BASE_URL", "http://localhost:3010");
   const projectId = readEnv("VERITIO_CLOUD_PROJECT_ID");
   const ingestToken = readEnv("VERITIO_CLOUD_INGEST_TOKEN");
   const readToken = process.env.VERITIO_CLOUD_READ_TOKEN;
   const scenario = buildFullGovernanceScenario({
     tenantId: projectId,
-    environment: "production",
+    environment: "test",
     actorId: process.env.VERITIO_CLOUD_ACTOR_ID ?? "sdk_poc_operator",
   });
 

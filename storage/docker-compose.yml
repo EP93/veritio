@@ -7,7 +7,7 @@
 # credentials, and host ports chosen to avoid this machine's existing
 # containers (5433/5434/54329/6380). Never point these at real evidence data.
 #
-#   docker compose -f storage/docker-compose.yml up -d --wait
+#   bun run --cwd storage db:up
 #   bun run --cwd storage test:live
 #   docker compose -f storage/docker-compose.yml down -v
 

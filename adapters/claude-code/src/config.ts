@@ -1,6 +1,9 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { MAX_INGEST_TIMEOUT_MS } from "./ingest.js";
+import { DEFAULT_SPOOL_LIMITS, type SpoolLimits } from "./spool.js";
+
 /**
  * Resolved adapter configuration. The local file store is always the working sink
  * (the reference MCP reads it); when both an ingest URL and key are present the
@@ -9,6 +12,8 @@ import { join } from "node:path";
 export interface AdapterConfig {
   localDir: string;
   ingest?: { url: string; key: string; timeoutMs?: number };
+  /** Optional on embedded config literals for backwards compatibility; resolveConfig always sets it. */
+  spoolLimits?: SpoolLimits;
   tenantId: string;
   /** The enforcing human (stable id, never an email/username). */
   actorId: string;
@@ -39,7 +44,19 @@ export function resolveConfig(env: NodeJS.ProcessEnv): AdapterConfig {
   }
 
   const config: AdapterConfig = {
-    localDir: env.VERITIO_LOCAL_DIR?.trim() || join(homedir(), ".veritio", "claude-code"),
+    localDir: resolveLocalDir(env),
+    spoolLimits: {
+      hardBatches: parseSpoolLimit(
+        env.VERITIO_SPOOL_HARD_BATCHES,
+        "VERITIO_SPOOL_HARD_BATCHES",
+        DEFAULT_SPOOL_LIMITS.hardBatches,
+      ),
+      hardBytes: parseSpoolLimit(
+        env.VERITIO_SPOOL_HARD_BYTES,
+        "VERITIO_SPOOL_HARD_BYTES",
+        DEFAULT_SPOOL_LIMITS.hardBytes,
+      ),
+    },
     tenantId: env.VERITIO_TENANT_ID?.trim() || "local",
     actorId: env.VERITIO_ACTOR_ID?.trim() || "local_developer",
     agentActorId: env.VERITIO_AGENT_ACTOR_ID?.trim() || "agent_claude_code",
@@ -63,6 +80,11 @@ export function resolveConfig(env: NodeJS.ProcessEnv): AdapterConfig {
   return config;
 }
 
+/** Resolves only the local queue path so offline operator commands need no ingest credentials. */
+export function resolveLocalDir(env: NodeJS.ProcessEnv): string {
+  return env.VERITIO_LOCAL_DIR?.trim() || join(homedir(), ".veritio", "claude-code");
+}
+
 /**
  * Parses the opt-in VERITIO_INGEST_TIMEOUT_MS override for the ship-out abort
  * bound. Fails closed on non-positive or non-numeric values instead of silently
@@ -74,8 +96,24 @@ function parseIngestTimeout(raw: string | undefined): number | undefined {
     return undefined;
   }
   const value = Number(trimmed);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error("VERITIO_INGEST_TIMEOUT_MS must be a positive integer of milliseconds");
+  if (!Number.isInteger(value) || value <= 0 || value > MAX_INGEST_TIMEOUT_MS) {
+    throw new Error(`VERITIO_INGEST_TIMEOUT_MS must be an integer between 1 and ${MAX_INGEST_TIMEOUT_MS} milliseconds`);
+  }
+  return value;
+}
+
+/**
+ * Parses a local queue limit. Environment overrides may lower the compiled-in
+ * ceiling but cannot enlarge the adapter's economic exposure.
+ */
+function parseSpoolLimit(raw: string | undefined, name: string, hardMaximum: number): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return hardMaximum;
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value < 1 || value > hardMaximum) {
+    throw new Error(`${name} must be a positive integer within the hard safety ceiling of ${hardMaximum}`);
   }
   return value;
 }

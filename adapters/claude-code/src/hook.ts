@@ -2,22 +2,22 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { type AuditEvent, type EvidenceEdge, type RecordResult, createProvenanceRecorder } from "@veritio/core";
+import { type AuditEvent, createProvenanceRecorder, type EvidenceEdge, type RecordResult } from "@veritio/core";
 import { createFileEvidenceStore } from "@veritio/storage";
 
 import { resolveConfig } from "./config.js";
-import { shipWithSpool } from "./spool.js";
 import {
-  type ChangedFile,
   buildBashFileChange,
   buildSessionContext,
   buildToolCall,
+  type ChangedFile,
   episodeIdOf,
   promptHashOf,
   rebuildSessionContext,
   refreshContextScope,
 } from "./map.js";
 import { sha256 } from "./redact.js";
+import { shipWithSpool } from "./spool.js";
 import { clearState, loadState, saveState } from "./state.js";
 import type { HookPayload, SessionContext } from "./types.js";
 
@@ -159,10 +159,9 @@ async function main(): Promise<void> {
 
   saveState(config.localDir, payload.session_id, state);
   if (config.ingest) {
-    // Spool-aware ship-out: outages queue the batch locally and later hooks
-    // replay it (idempotent server ingest), so a down/quota-blocked endpoint
-    // no longer silently drops evidence. See spool.ts.
-    await shipWithSpool(config.ingest, config.localDir, { events, edges });
+    // Ordinary capture may append to the durable queue but never drains it.
+    // Replay requires a separate, explicit finite operator permit.
+    await shipWithSpool(config.ingest, config.localDir, { events, edges }, config.spoolLimits);
   }
 }
 

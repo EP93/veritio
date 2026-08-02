@@ -20,7 +20,8 @@
   "type": "module",
   "bin": {
     "veritio-claude-code-hook": "dist/hook.js",
-    "veritio-claude-code-mcp": "dist/mcp.js"
+    "veritio-claude-code-mcp": "dist/mcp.js",
+    "veritio-claude-code-spool": "dist/spool-cli.js"
   },
   "exports": {
     ".": {

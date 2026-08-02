@@ -2,7 +2,13 @@ import { afterAll, describe, expect, test } from "bun:test";
 import type { AuditEvent } from "@veritio/core";
 
 import { resolveConfig } from "../config";
-import { DEFAULT_INGEST_TIMEOUT_MS, postToIngest } from "../ingest";
+import * as ingestModule from "../ingest";
+import { DEFAULT_INGEST_TIMEOUT_MS, IngestHttpError, postToIngest } from "../ingest";
+
+const { deliveryDispositionOf, MAX_INGEST_TIMEOUT_MS } = ingestModule as typeof ingestModule & {
+  deliveryDispositionOf(error: unknown): "retry" | "pause" | "reject";
+  MAX_INGEST_TIMEOUT_MS: number;
+};
 
 /**
  * Regression suite for the ship-out abort bound. An UNBOUNDED postToIngest once
@@ -48,10 +54,44 @@ const failingServer = Bun.serve({
   },
 });
 
+const dispositionServer = Bun.serve({
+  port: 0,
+  fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/pause") {
+      return Response.json(
+        {
+          error: "ingest is temporarily paused",
+          code: "economic_safety_hold",
+          deliveryDisposition: "pause",
+          retryable: false,
+          retryAt: "2026-08-03T00:00:00.000Z",
+          circuitId: "cir_01",
+        },
+        { status: 503 },
+      );
+    }
+    if (path === "/legacy-pause") {
+      return Response.json(
+        { error: "monthly event quota exceeded", code: "monthly_event_quota_exceeded", retryable: false },
+        { status: 402 },
+      );
+    }
+    if (path === "/reject") {
+      return Response.json(
+        { error: "scope mismatch", code: "scope_mismatch", deliveryDisposition: "reject", retryable: false },
+        { status: 403 },
+      );
+    }
+    return Response.json({ error: "temporary failure" }, { status: 503 });
+  },
+});
+
 afterAll(() => {
   hangingServer.stop(true);
   okServer.stop(true);
   failingServer.stop(true);
+  dispositionServer.stop(true);
 });
 
 describe("postToIngest — bounded abort (the un-freeze invariant)", () => {
@@ -89,6 +129,57 @@ describe("postToIngest — bounded abort (the un-freeze invariant)", () => {
     await postToIngest({ url: hangingServer.url.href, key: "vrt_test", timeoutMs: 250 }, { events: [], edges: [] });
     expect(requests).toBe(before);
   });
+
+  test("a portable pause response survives as a typed non-retry disposition", async () => {
+    const error = await postToIngest(
+      { url: new URL("/pause", dispositionServer.url).href, key: "vrt_test", timeoutMs: 2_000 },
+      { events: [EVENT], edges: [] },
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(IngestHttpError);
+    expect(error).toMatchObject({
+      status: 503,
+      deliveryDisposition: "pause",
+      code: "economic_safety_hold",
+      retryAt: "2026-08-03T00:00:00.000Z",
+      circuitId: "cir_01",
+    });
+    expect(deliveryDispositionOf(error)).toBe("pause");
+  });
+
+  test("a recognized legacy quota code pauses even without deliveryDisposition", async () => {
+    const error = await postToIngest(
+      { url: new URL("/legacy-pause", dispositionServer.url).href, key: "vrt_test", timeoutMs: 2_000 },
+      { events: [EVENT], edges: [] },
+    ).catch((caught: unknown) => caught);
+
+    expect(deliveryDispositionOf(error)).toBe("pause");
+  });
+
+  test("explicit reject and legacy status fallback classify without inspecting secrets", async () => {
+    const rejected = await postToIngest(
+      { url: new URL("/reject", dispositionServer.url).href, key: "vrt_test", timeoutMs: 2_000 },
+      { events: [EVENT], edges: [] },
+    ).catch((caught: unknown) => caught);
+    const legacyRetry = await postToIngest(
+      { url: dispositionServer.url.href, key: "vrt_test", timeoutMs: 2_000 },
+      { events: [EVENT], edges: [] },
+    ).catch((caught: unknown) => caught);
+
+    expect(deliveryDispositionOf(rejected)).toBe("reject");
+    expect(deliveryDispositionOf(legacyRetry)).toBe("retry");
+    expect((rejected as Error).message).not.toContain("scope mismatch");
+  });
+
+  test("direct callers cannot disable the timeout with non-finite or oversized values", async () => {
+    for (const timeoutMs of [0, -1, Number.POSITIVE_INFINITY, MAX_INGEST_TIMEOUT_MS + 1]) {
+      const error = await postToIngest(
+        { url: okServer.url.href, key: "vrt_test", timeoutMs },
+        { events: [EVENT], edges: [] },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(TypeError);
+    }
+  });
 });
 
 describe("resolveConfig — VERITIO_INGEST_TIMEOUT_MS (process boundary only)", () => {
@@ -108,7 +199,7 @@ describe("resolveConfig — VERITIO_INGEST_TIMEOUT_MS (process boundary only)", 
   });
 
   test("invalid values fail closed instead of capturing with a broken bound", () => {
-    for (const bad of ["0", "-5", "abc", "1.5"]) {
+    for (const bad of ["0", "-5", "abc", "1.5", String(MAX_INGEST_TIMEOUT_MS + 1)]) {
       expect(() => resolveConfig({ ...base, VERITIO_INGEST_TIMEOUT_MS: bad } as NodeJS.ProcessEnv)).toThrow(
         "VERITIO_INGEST_TIMEOUT_MS",
       );

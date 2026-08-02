@@ -69,6 +69,14 @@ export interface VirtualKeyConfig {
 export interface IngestConfig {
   url: string;
   key: string;
+  /** Held by default; canary grants one automatic request for this process. */
+  startupMode: "held" | "canary";
+  /** Finite one-request authorization compiled into the storage DispatchPermit. */
+  canary: {
+    maxBytes: number;
+    maxElapsedMs: number;
+    leaseMs: number;
+  };
 }
 
 /**
@@ -108,6 +116,8 @@ export class GatewayConfigError extends Error {
 const PROVIDERS: readonly GatewayProvider[] = ["anthropic", "openai"];
 const ENDPOINTS: readonly GatewayEndpoint[] = ["messages", "chat-completions"];
 const HEX_64 = /^[a-f0-9]{64}$/;
+const DEFAULT_CANARY = Object.freeze({ maxBytes: 250_000, maxElapsedMs: 5_000, leaseMs: 30_000 });
+const MAX_CANARY = Object.freeze({ maxBytes: 1_048_576, maxElapsedMs: 15_000, leaseMs: 60_000 });
 
 /** Narrows to a plain object, failing closed with the field path otherwise. */
 function requireObject(value: unknown, field: string): Record<string, unknown> {
@@ -132,6 +142,15 @@ function optionalBoolean(value: unknown, field: string, fallback: boolean): bool
     throw new GatewayConfigError(field, "expected a boolean");
   }
   return value;
+}
+
+/** Parses a positive integer without allowing config to raise a compiled-in hard ceiling. */
+function optionalBoundedInteger(value: unknown, field: string, fallback: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > maximum) {
+    throw new GatewayConfigError(field, `expected a positive integer no greater than ${maximum}`);
+  }
+  return value as number;
 }
 
 /**
@@ -161,9 +180,40 @@ export function parseGatewayConfig(raw: unknown): GatewayConfig {
   let ingest: IngestConfig | undefined;
   if (root.ingest !== undefined) {
     const entry = requireObject(root.ingest, "ingest");
+    const startupMode = entry.startupMode ?? "held";
+    if (startupMode !== "held" && startupMode !== "canary") {
+      throw new GatewayConfigError("ingest.startupMode", 'expected "held" or "canary"');
+    }
+    const canaryRaw = entry.canary === undefined ? {} : requireObject(entry.canary, "ingest.canary");
+    const maxElapsedMs = optionalBoundedInteger(
+      canaryRaw.maxElapsedMs,
+      "ingest.canary.maxElapsedMs",
+      DEFAULT_CANARY.maxElapsedMs,
+      MAX_CANARY.maxElapsedMs,
+    );
+    const leaseMs = optionalBoundedInteger(
+      canaryRaw.leaseMs,
+      "ingest.canary.leaseMs",
+      DEFAULT_CANARY.leaseMs,
+      MAX_CANARY.leaseMs,
+    );
+    if (leaseMs <= maxElapsedMs) {
+      throw new GatewayConfigError("ingest.canary.leaseMs", "must exceed ingest.canary.maxElapsedMs");
+    }
     ingest = {
       url: requireString(entry.url, "ingest.url"),
       key: requireString(entry.key, "ingest.key"),
+      startupMode,
+      canary: {
+        maxBytes: optionalBoundedInteger(
+          canaryRaw.maxBytes,
+          "ingest.canary.maxBytes",
+          DEFAULT_CANARY.maxBytes,
+          MAX_CANARY.maxBytes,
+        ),
+        maxElapsedMs,
+        leaseMs,
+      },
     };
   }
 

@@ -16,7 +16,7 @@ import { createCaptureEnvironment, simulateSession } from "./capture";
  * ```
  */
 async function main() {
-  const baseUrl = readEnv("VERITIO_CLOUD_BASE_URL", "https://console.getveritio.com");
+  const baseUrl = readEnv("VERITIO_CLOUD_BASE_URL", "http://localhost:3010");
   const projectId = readEnv("VERITIO_CLOUD_PROJECT_ID");
   const ingestToken = readEnv("VERITIO_CLOUD_INGEST_TOKEN");
   const sessionId = process.env.VERITIO_CLOUD_SESSION_ID ?? `sess_cloud_demo_${Date.now().toString(36)}`;

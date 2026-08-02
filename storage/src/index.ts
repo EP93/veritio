@@ -1,14 +1,14 @@
 import {
-  HASH_ALGORITHM,
-  canonicalJson,
-  hashAuditRecord,
-  hashIdempotencyKey,
   type AuditEvent,
   type AuditRecord,
   type AuditStore,
   type AuditStoreAppendOptions,
   type AuditStoreListOptions,
+  canonicalJson,
   type EvidenceScope,
+  HASH_ALGORITHM,
+  hashAuditRecord,
+  hashIdempotencyKey,
 } from "@veritio/core";
 
 export const POSTGRES_AUDIT_RECORDS_SCHEMA_SQL = `CREATE TABLE IF NOT EXISTS veritio_audit_records (
@@ -736,6 +736,7 @@ function cloneRecord(record: AuditRecord): AuditRecord {
 }
 
 export * from "./clickhouse-read-model.js";
+export * from "./delivery-safety.js";
 export * from "./file-store.js";
 export * from "./ingest-target.js";
 export * from "./object-archive.js";

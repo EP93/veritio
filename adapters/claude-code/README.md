@@ -62,21 +62,61 @@ Read only at the process boundary; no credential is embedded in the hook.
 | `VERITIO_ENVIRONMENT` | `development` | Scope environment |
 | `VERITIO_WORKSPACE_ID` | — | Optional workspace scope |
 | `VERITIO_INGEST_URL` + `VERITIO_INGEST_KEY` | — | If **both** set, also POST records to a Veritio ingest endpoint (e.g. Veritio Cloud), so captured sessions surface in the hosted Sessions UI. The server re-redacts. |
-| `VERITIO_INGEST_TIMEOUT_MS` | `10000` | Abort bound (ms) for one ingest POST. A stalled endpoint can never block the agent past this bound; the hook still exits 0 (capture is fail-open, the local store already has the records). |
+| `VERITIO_INGEST_TIMEOUT_MS` | `10000` | Abort bound (ms) for one ingest POST, constrained to `1..30000`. The hook still exits 0 because the local store is authoritative for capture. |
+| `VERITIO_SPOOL_HARD_BATCHES` | `250` | Optional lower queue batch ceiling. It cannot raise the compiled-in hard ceiling. |
+| `VERITIO_SPOOL_HARD_BYTES` | `50000000` | Optional lower queue byte ceiling. It cannot raise the compiled-in hard ceiling. |
 
-### Offline spool (ingest outages)
+### Durable delivery queue
 
-When a ship-out fails for a **retryable** reason (endpoint unreachable, timeout,
-HTTP 5xx/429 — e.g. the hosted tenant database being temporarily unavailable),
-the batch is queued under `<localDir>/spool/` and replayed by later hook
-invocations once the endpoint recovers, oldest first, a few batches per hook so
-the hook time bound holds. Replay is safe because record ids are deterministic
-and server ingest is idempotent. Permanent rejections (other 4xx: bad key,
-tenant mismatch, malformed batch) are never queued. The queue is capped at
-1,000 batches (oldest dropped first, with a stderr note); spooled files contain
-exactly the redacted, hash-only payload the wire would have carried. The spool
-is currently TypeScript-only — a Python/Go capture adapter must reproduce this
-ship-out behavior (see `.claude/rules/02-sdk-parity.md`).
+Remote delivery has three durable outcomes:
+
+- `retry`: transport failures, HTTP 429, and legacy 5xx responses remain in the
+  pending queue.
+- `pause`: an explicit server pause (including recognized legacy quota codes)
+  opens a sticky circuit and moves the entire queue to held. Later hooks append
+  locally and make **zero** remote attempts.
+- `reject`: permanent failures are moved to quarantine with the redacted payload
+  intact; they are never silently deleted.
+
+Ordinary hook invocations never replay a backlog. Recovery requires a separate
+operator command and every replay epoch is bounded by batches, records, encoded
+bytes, and elapsed time. This prevents an endpoint recovery, quota upgrade, or
+misclassified provider failure from turning many routine hooks into an
+uncontrolled egress drain.
+
+The queue lives under `<localDir>/spool/` with `pending`, `held`, and
+`quarantine` states. The hard ceiling is 250 batches or 50 MB. At the ceiling,
+existing entries are retained, pending entries move to held, and the newest
+remote-delivery copy is refused with a visible stderr signal. Older flat spool
+files upgrade into a manual hold; they do not auto-replay.
+
+Use the operator CLI to inspect and control delivery:
+
+```sh
+veritio-claude-code-spool status
+veritio-claude-code-spool pause --reason "provider transfer alarm"
+veritio-claude-code-spool quarantine
+
+# At most one request, 500 records / 1 MB / 5 seconds.
+veritio-claude-code-spool canary
+
+# Every drain budget is mandatory and is checked before each request.
+veritio-claude-code-spool drain \
+  --max-batches 10 \
+  --max-records 5000 \
+  --max-bytes 10000000 \
+  --max-elapsed-ms 15000
+
+# Resume only moves held entries back to pending; it performs no network I/O.
+veritio-claude-code-spool resume --acknowledge "provider headroom reviewed"
+```
+
+`status`, `pause`, `resume`, and `quarantine` work without ingest credentials.
+`canary` and `drain` require both ingest variables. CLI output contains queue
+metadata, never event payloads or credentials. Spool payload files contain the
+same redacted, hash-only batch prepared for the wire. The queue is currently
+TypeScript-only; another capture adapter must reproduce the same disposition
+and replay-permit semantics (see `.claude/rules/02-sdk-parity.md`).
 
 ## Query + export (MCP)
 

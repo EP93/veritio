@@ -1,5 +1,14 @@
 import type { AuditEventInput, EvidenceEdgeInput } from "@veritio/core";
-import type { OutboxAdapter, OutboxDispatcher, OutboxListOptions, OutboxPayload } from "./outbox.js";
+import { type DeliveryDisposition, type DeliverySafetyPolicy, parseDeliverySafetyPolicy } from "./delivery-safety.js";
+import {
+  dispatchLeaseId,
+  emptyDispatchResult,
+  type OutboxAdapter,
+  type OutboxDispatcher,
+  type OutboxPayload,
+  outboxPayloadByteLength,
+  validateDispatchOptions,
+} from "./outbox.js";
 
 /**
  * HTTP delivery of governed-change evidence to a Veritio ingest endpoint.
@@ -17,6 +26,9 @@ import type { OutboxAdapter, OutboxDispatcher, OutboxListOptions, OutboxPayload 
  */
 
 const DEFAULT_INGEST_PATH = "/api/ingest";
+
+/** Finite default for every SDK-owned HTTP ingest attempt. */
+export const DEFAULT_HTTP_INGEST_TIMEOUT_MS = 10_000;
 
 export interface IngestBatch {
   events: readonly AuditEventInput[];
@@ -41,42 +53,98 @@ const EMPTY_RESULT: IngestResult = {
  */
 export class IngestError extends Error {
   readonly status: number;
+  readonly disposition: DeliveryDisposition;
   readonly retryable: boolean;
   readonly appended?: { events: number; edges: number } | undefined;
+  readonly circuitId?: string | undefined;
+  readonly retryAfterSeconds?: number | undefined;
 
+  /** Stores only typed control metadata and a sanitized caller-authored message. */
   constructor(
     message: string,
-    options: { status: number; retryable: boolean; appended?: { events: number; edges: number } | undefined },
+    options: {
+      status: number;
+      disposition: DeliveryDisposition;
+      appended?: { events: number; edges: number } | undefined;
+      circuitId?: string | undefined;
+      retryAfterSeconds?: number | undefined;
+    },
   ) {
     super(message);
     this.name = "IngestError";
     this.status = options.status;
-    this.retryable = options.retryable;
+    this.disposition = options.disposition;
+    this.retryable = options.disposition === "retry";
     this.appended = options.appended;
+    this.circuitId = options.circuitId;
+    this.retryAfterSeconds = options.retryAfterSeconds;
   }
 }
 
 /** A `5xx` ingest failure: transient, the outbox should retry. */
 export class IngestRetryableError extends IngestError {
+  /** Classifies a transient server failure without retaining its response text. */
   constructor(status: number, appended?: { events: number; edges: number } | undefined) {
-    super(`ingest is temporarily unavailable (status ${status})`, { status, retryable: true, appended });
+    super(`ingest is temporarily unavailable (status ${status})`, { status, disposition: "retry", appended });
     this.name = "IngestRetryableError";
   }
 }
 
 /** A `409` append/idempotency conflict: not retryable without changing inputs. */
 export class IngestConflictError extends IngestError {
+  /** Classifies an append conflict as a terminal rejection. */
   constructor(appended?: { events: number; edges: number } | undefined) {
-    super("ingest rejected the batch as an append conflict (status 409)", { status: 409, retryable: false, appended });
+    super("ingest rejected the batch as an append conflict (status 409)", {
+      status: 409,
+      disposition: "reject",
+      appended,
+    });
     this.name = "IngestConflictError";
   }
 }
 
 /** A `4xx` client rejection (auth, scope, validation, too-many-records). */
 export class IngestClientError extends IngestError {
+  /** Classifies a client-side request rejection as terminal. */
   constructor(status: number, appended?: { events: number; edges: number } | undefined) {
-    super(`ingest rejected the batch (status ${status})`, { status, retryable: false, appended });
+    super(`ingest rejected the batch (status ${status})`, { status, disposition: "reject", appended });
     this.name = "IngestClientError";
+  }
+}
+
+/** An explicit terminal server disposition for work that must not be replayed. */
+export class IngestRejectedError extends IngestError {
+  /** Retains only the status and committed counts from a validated reject verdict. */
+  constructor(status: number, appended?: { events: number; edges: number } | undefined) {
+    super(`ingest permanently rejected the batch (status ${status})`, {
+      status,
+      disposition: "reject",
+      appended,
+    });
+    this.name = "IngestRejectedError";
+  }
+}
+
+/**
+ * A hosted economic-safety circuit hold. It is not retryable: dispatchers must
+ * persist a tenant barrier and await explicit recovery authorization.
+ */
+export class IngestPausedError extends IngestError {
+  /** Preserves only bounded circuit controls from a verified economic hold. */
+  constructor(
+    status: number,
+    options: {
+      appended?: { events: number; edges: number } | undefined;
+      circuitId?: string | undefined;
+      retryAfterSeconds?: number | undefined;
+    } = {},
+  ) {
+    super(`ingest delivery is paused by an economic safety circuit (status ${status})`, {
+      status,
+      disposition: "pause",
+      ...options,
+    });
+    this.name = "IngestPausedError";
   }
 }
 
@@ -86,7 +154,9 @@ export class IngestClientError extends IngestError {
  * for callers that already hold a `{events, edges}` batch.
  */
 export interface HttpIngestTarget {
+  /** Sends one already-minimized batch within the configured byte and time bounds. */
   postBatch(batch: IngestBatch): Promise<IngestResult>;
+  /** Sends one durable outbox payload as exactly one HTTP request. */
   dispatchEntry(payload: OutboxPayload): Promise<IngestResult>;
 }
 
@@ -97,6 +167,10 @@ export interface HttpIngestTargetOptions {
   key: string;
   /** Ingest path; defaults to `/api/ingest`. */
   path?: string;
+  /** Finite abort bound in milliseconds; defaults to ten seconds. */
+  timeoutMs?: number;
+  /** Optional stricter finite SDK transport policy. */
+  deliverySafety?: DeliverySafetyPolicy;
   /** Injectable fetch for testing. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
 }
@@ -115,6 +189,8 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
   const path = options.path ?? DEFAULT_INGEST_PATH;
   const url = `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const timeoutMs = requirePositiveInteger(options.timeoutMs ?? DEFAULT_HTTP_INGEST_TIMEOUT_MS, "timeoutMs");
+  const deliverySafety = parseDeliverySafetyPolicy(options.deliverySafety);
   if (typeof fetchImpl !== "function") {
     throw new TypeError("a fetch implementation is required (pass fetchImpl)");
   }
@@ -124,15 +200,24 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
    * typed, sanitized error. Returns early without a network call for an empty
    * batch so dispatching an edge-only or empty entry is cheap.
    */
-  async function postBatch(batch: IngestBatch): Promise<IngestResult> {
+  async function postBatchWithMode(batch: IngestBatch, delivery: "live-v1" | "replay-v1"): Promise<IngestResult> {
     if (batch.events.length === 0 && batch.edges.length === 0) {
       return EMPTY_RESULT;
     }
 
+    const requestBody = JSON.stringify({ events: batch.events, edges: batch.edges });
+    if (new TextEncoder().encode(requestBody).byteLength > deliverySafety.hard.batchBytes) {
+      throw new IngestClientError(413);
+    }
     const response = await fetchImpl(url, {
       method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify({ events: batch.events, edges: batch.edges }),
+      headers: {
+        authorization: `Bearer ${key}`,
+        "content-type": "application/json",
+        "x-veritio-delivery": delivery,
+      },
+      body: requestBody,
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     const body = await safeJson(response);
@@ -141,6 +226,13 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
     }
 
     const appended = extractAppended(body);
+    const pause = extractEconomicSafetyPause(body);
+    if (pause !== null) {
+      throw new IngestPausedError(response.status, { appended, ...pause });
+    }
+    if (extractExplicitRejection(body)) {
+      throw new IngestRejectedError(response.status, appended);
+    }
     if (response.status === 409) {
       throw new IngestConflictError(appended);
     }
@@ -151,7 +243,9 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
   }
 
   return {
-    postBatch,
+    postBatch(batch): Promise<IngestResult> {
+      return postBatchWithMode(batch, "live-v1");
+    },
     /**
      * Delivers one outbox payload as a single POST of its records + edges.
      */
@@ -159,7 +253,7 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
       if (!payload || !Array.isArray(payload.records) || !Array.isArray(payload.edges)) {
         throw new TypeError("outbox payload must contain records and edges arrays");
       }
-      return postBatch({ events: payload.records, edges: payload.edges });
+      return postBatchWithMode({ events: payload.records, edges: payload.edges }, "replay-v1");
     },
   };
 }
@@ -174,34 +268,55 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
 export function createHttpOutboxDispatcher(options: {
   adapter: OutboxAdapter;
   target: Pick<HttpIngestTarget, "dispatchEntry">;
+  deliverySafety?: DeliverySafetyPolicy;
 }): OutboxDispatcher {
+  const deliverySafety = parseDeliverySafetyPolicy(options.deliverySafety);
   return {
-    async dispatchBatch(listOptions: OutboxListOptions = {}) {
-      let dispatched = 0;
-      let failed = 0;
-      const entries = await options.adapter.listDispatchable(listOptions);
-      for (const entry of entries) {
+    async dispatchBatch(dispatchOptions) {
+      validateDispatchOptions(dispatchOptions, deliverySafety);
+      const result = emptyDispatchResult();
+      const startedAt = Date.now();
+      for (let index = 0; index < dispatchOptions.permit.maxEntries; index += 1) {
+        if (Date.now() - startedAt >= dispatchOptions.permit.maxElapsedMs) break;
+        const remainingBytes = dispatchOptions.permit.maxBytes - result.bytes;
+        if (remainingBytes <= 0) break;
+        const leaseId = dispatchLeaseId(dispatchOptions.permit, index);
+        const [entry] = await options.adapter.claimDispatchable({
+          tenantId: dispatchOptions.tenantId,
+          ...(dispatchOptions.now === undefined ? {} : { now: dispatchOptions.now }),
+          leaseId,
+          leaseMs: dispatchOptions.permit.leaseMs,
+          limit: 1,
+          maxPayloadBytes: Math.min(remainingBytes, deliverySafety.hard.batchBytes),
+        });
+        if (!entry) break;
+        result.bytes += outboxPayloadByteLength(entry.payload);
         try {
           await options.target.dispatchEntry(entry.payload);
           await options.adapter.markDispatched(
             entry.id,
-            listOptions.now === undefined ? {} : { dispatchedAt: listOptions.now },
+            dispatchOptions.now === undefined
+              ? { leaseId: entry.leaseId }
+              : { leaseId: entry.leaseId, dispatchedAt: dispatchOptions.now },
           );
-          dispatched += 1;
+          result.dispatched += 1;
         } catch (error) {
           // Honor the typed verdict: a non-retryable rejection (4xx/409) is
           // dead-lettered so it is never re-dispatched; a transient 5xx (or any
           // unexpected non-typed throw) stays retryable rather than being
           // silently parked.
-          const retryable = error instanceof IngestError ? error.retryable : true;
+          const disposition = error instanceof IngestError ? error.disposition : "retry";
           await options.adapter.markFailed(entry.id, error, {
-            ...(listOptions.now === undefined ? {} : { now: listOptions.now }),
-            retryable,
+            leaseId: entry.leaseId,
+            ...(dispatchOptions.now === undefined ? {} : { now: dispatchOptions.now }),
+            disposition,
+            ...(error instanceof IngestError && error.circuitId !== undefined ? { circuitId: error.circuitId } : {}),
           });
-          failed += 1;
+          result[disposition === "retry" ? "retried" : disposition === "pause" ? "paused" : "rejected"] += 1;
+          if (disposition !== "reject") break;
         }
       }
-      return { dispatched, failed };
+      return result;
     },
   };
 }
@@ -249,13 +364,57 @@ function extractAppended(body: unknown): { events: number; edges: number } | und
   return undefined;
 }
 
+/**
+ * Trusts a terminal response only when both portable control fields agree.
+ * This lets a server report post-commit derived-processing failure without a
+ * 5xx status fallback teaching clients to replay already-committed evidence.
+ */
+function extractExplicitRejection(body: unknown): boolean {
+  return isRecord(body) && body.deliveryDisposition === "reject" && body.retryable === false;
+}
+
+/**
+ * Accepts pause metadata only for the exact hosted economic-safety code and
+ * validated bounded fields, preventing arbitrary server text from entering SDK
+ * state or changing generic 5xx retry semantics.
+ */
+function extractEconomicSafetyPause(
+  body: unknown,
+): { circuitId?: string | undefined; retryAfterSeconds?: number | undefined } | null {
+  if (!isRecord(body) || body.code !== "economic_safety_hold" || body.deliveryDisposition !== "pause") {
+    return null;
+  }
+  const result: { circuitId?: string; retryAfterSeconds?: number } = {};
+  if (typeof body.circuitId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(body.circuitId)) {
+    result.circuitId = body.circuitId;
+  }
+  if (
+    typeof body.retryAfterSeconds === "number" &&
+    Number.isSafeInteger(body.retryAfterSeconds) &&
+    body.retryAfterSeconds > 0
+  ) {
+    result.retryAfterSeconds = body.retryAfterSeconds;
+  }
+  return result;
+}
+
+/** Narrows an untrusted response body to a non-array object. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Requires a non-empty host-provided endpoint or credential string. */
 function requireNonEmpty(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`${field} is required`);
+  }
+  return value;
+}
+
+/** Requires a finite positive integer for network bounds. */
+function requirePositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${field} must be a positive safe integer`);
   }
   return value;
 }
