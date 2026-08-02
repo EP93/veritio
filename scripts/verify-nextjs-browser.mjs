@@ -25,11 +25,15 @@ async function main() {
     return;
   }
 
-  const server = spawn("bun", ["run", "--cwd", filePath(exampleDir), "dev", "--", "-H", "127.0.0.1", "-p", String(port)], {
-    cwd: filePath(root),
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const server = spawn(
+    "bun",
+    ["run", "--cwd", filePath(exampleDir), "dev", "--", "-H", "127.0.0.1", "-p", String(port)],
+    {
+      cwd: filePath(root),
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   const output = [];
   server.stdout.on("data", (chunk) => output.push(chunk.toString()));
   server.stderr.on("data", (chunk) => output.push(chunk.toString()));
@@ -65,8 +69,8 @@ async function isVeritioNextApp(url) {
 }
 
 /**
- * Clicks the governed-change flow and verifies the user-facing investigation
- * surfaces without exposing raw email or HMAC secret material in the browser.
+ * Runs the reference agent session and verifies the browser-visible governed
+ * recalculations without exposing server-only HMAC material.
  */
 async function verifyBrowserFlow(url) {
   const browser = await chromium.launch({ headless: true, channel: browserChannel });
@@ -82,19 +86,20 @@ async function verifyBrowserFlow(url) {
       page.on("pageerror", (error) => consoleErrors.push(error.message));
       try {
         await page.goto(url, { waitUntil: "domcontentloaded" });
-        await page.getByRole("button", { name: /Run change/i }).click();
-        await page.waitForFunction(() => document.body.innerText.includes("hmac-sha256"), null, { timeout: 15_000 });
+        await page.getByRole("button", { name: "Run agent session", exact: true }).click();
+        await page.getByText("Recalculated 2", { exact: true }).waitFor({ timeout: 15_000 });
         const text = await page.locator("body").innerText();
-        assertIncludes(text, "Changes", viewport.name);
-        assertIncludes(text, "Entity timeline", viewport.name);
-        assertIncludes(text, "Explain value", viewport.name);
-        assertIncludes(text, "Revision diff", viewport.name);
-        assertIncludes(text, "hmac-sha256", viewport.name);
-        assertIncludes(text, "tenant-key-7", viewport.name);
-        assertIncludes(text, "project.entry.rollback", viewport.name);
-        assertIncludes(text, "148220", viewport.name);
-        assertExcludes(text, "buyer@example.com", viewport.name);
-        assertExcludes(text, "test-hmac-secret", viewport.name);
+        assertIncludes(text, "Agent sessions", viewport.name);
+        assertIncludes(text, "Recalculated 2", viewport.name);
+        assertIncludes(text, "veritio-cost-agent (cost_agent_7)", viewport.name);
+        assertIncludes(text, "anthropic/claude-opus-4-8", viewport.name);
+        assertIncludes(text, "Approved", viewport.name);
+        assertIncludes(text, "Captured locally", viewport.name);
+        assertIncludes(text, "Recent governed changes", viewport.name);
+        assertIncludes(text, "project_entry.estimate.recalculation", viewport.name);
+        assertIncludes(text, "Tower A — structural estimate", viewport.name);
+        assertIncludes(text, "Tower B — facade package", viewport.name);
+        assertExcludes(text, "nextjs-example-keyed-digest-secret", viewport.name);
         if (consoleErrors.length > 0) {
           throw new Error(`${viewport.name} browser console errors: ${consoleErrors.join("\n")}`);
         }

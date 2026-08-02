@@ -411,6 +411,9 @@ describe("Workbench HTTP app", () => {
     expect(homeText).toContain("Veritio Workbench");
     expect(homeText).toContain("Evidence Commits");
 
+    const favicon = await app.fetch(new Request("http://veritio.local/favicon.ico"));
+    expect(favicon.status).toBe(204);
+
     const eventResponse = await app.fetch(
       new Request("http://veritio.local/v1/events", {
         method: "POST",
