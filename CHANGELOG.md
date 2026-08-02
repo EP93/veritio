@@ -4,6 +4,21 @@ All notable changes to Veritio will be documented in this file.
 
 Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while the protocol, SDKs, adapters, and storage contracts settle. Release notes should be explicit about migration steps and should avoid legal-compliance guarantees.
 
+## [0.4.4] - 2026-08-02
+
+### Changed
+
+- Docs-only republish so npm shows the reworked package READMEs and the new
+  `homepage` link to getveritio.com. No runtime or protocol changes.
+  `@veritio/core` 0.4.4, `@veritio/storage` 0.4.4, `@veritio/claude-code`
+  0.4.5 (pins bumped to 0.4.4), and framework adapters
+  (`@veritio/better-auth`, `@veritio/next`, `@veritio/tanstack-start`,
+  `@veritio/sveltekit`, `@veritio/react`, `@veritio/vue`, `@veritio/svelte`)
+  0.0.3.
+- `scripts/release-npm.sh` now also publishes the framework adapters after the
+  core/storage/claude-code trio, keeping the skip-if-published behavior for
+  partial releases.
+
 ## [0.4.3] - 2026-07-15
 
 ### Added

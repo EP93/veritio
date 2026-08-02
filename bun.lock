@@ -13,7 +13,7 @@
     },
     "adapters/better-auth": {
       "name": "@veritio/better-auth",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -27,7 +27,7 @@
     },
     "adapters/claude-code": {
       "name": "@veritio/claude-code",
-      "version": "0.4.4",
+      "version": "0.4.5",
       "bin": {
         "veritio-claude-code-hook": "dist/hook.js",
         "veritio-claude-code-mcp": "dist/mcp.js",
@@ -72,7 +72,7 @@
     },
     "adapters/next": {
       "name": "@veritio/next",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -86,7 +86,7 @@
     },
     "adapters/react": {
       "name": "@veritio/react",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "peerDependencies": {
         "react": ">=19.2.7",
       },
@@ -96,7 +96,7 @@
     },
     "adapters/svelte": {
       "name": "@veritio/svelte",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "peerDependencies": {
         "svelte": ">=5.56.3",
       },
@@ -106,7 +106,7 @@
     },
     "adapters/sveltekit": {
       "name": "@veritio/sveltekit",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -120,7 +120,7 @@
     },
     "adapters/tanstack-start": {
       "name": "@veritio/tanstack-start",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -145,7 +145,7 @@
     },
     "adapters/vue": {
       "name": "@veritio/vue",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "peerDependencies": {
         "vue": ">=3.5.38",
       },
@@ -174,7 +174,7 @@
     },
     "sdks/typescript": {
       "name": "@veritio/core",
-      "version": "0.4.3",
+      "version": "0.4.4",
     },
     "server/node": {
       "name": "@veritio/server",
@@ -185,7 +185,7 @@
     },
     "storage": {
       "name": "@veritio/storage",
-      "version": "0.4.3",
+      "version": "0.4.4",
       "devDependencies": {
         "@veritio/core": "workspace:*",
         "mongodb": "^7.3.0",
