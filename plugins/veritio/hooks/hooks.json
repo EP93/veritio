@@ -1,11 +1,54 @@
 {
   "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "bunx -y @veritio/claude-code veritio-claude-code-hook" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bunx -y @veritio/claude-code veritio-claude-code-hook" }] }],
-    "PreToolUse": [{ "matcher": "Edit|Write|MultiEdit", "hooks": [{ "type": "command", "command": "bunx -y @veritio/claude-code veritio-claude-code-hook" }] }],
-    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "bunx -y @veritio/claude-code veritio-claude-code-hook" }] }],
-    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "bunx -y @veritio/claude-code veritio-claude-code-hook" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "bunx -y @veritio/claude-code veritio-claude-code-hook" }] }],
-    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bunx -y @veritio/claude-code veritio-claude-code-hook" }] }]
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook" }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook" }
+        ]
+      }
+    ]
   }
 }

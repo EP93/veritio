@@ -1,6 +1,6 @@
 {
   "name": "@veritio/codex",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Capture Codex CLI agent activity as Veritio evidence via the notify hook, with a local file sink or ingest POST.",
   "license": "Apache-2.0",
   "repository": {

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import type { AuditEvent } from "@veritio/core";
 
 import { resolveConfig } from "../config";
-import { DEFAULT_INGEST_TIMEOUT_MS, postToIngest } from "../ingest";
+import { DEFAULT_INGEST_TIMEOUT_MS, MAX_INGEST_TIMEOUT_MS, postToIngest } from "../ingest";
 
 /**
  * Mirrors `@veritio/claude-code`'s ingest regression suite (capture-adapter
@@ -51,6 +51,16 @@ describe("postToIngest — bounded abort", () => {
   test("the default bound exists and is finite", () => {
     expect(DEFAULT_INGEST_TIMEOUT_MS).toBeGreaterThan(0);
     expect(Number.isFinite(DEFAULT_INGEST_TIMEOUT_MS)).toBe(true);
+    expect(MAX_INGEST_TIMEOUT_MS).toBe(30_000);
+  });
+
+  test("a direct caller cannot bypass the maximum timeout", () => {
+    expect(
+      postToIngest(
+        { url: hangingServer.url.href, key: "vrt_test", timeoutMs: MAX_INGEST_TIMEOUT_MS + 1 },
+        { events: [EVENT], edges: [] },
+      ),
+    ).rejects.toThrow(/between 1 and 30000/);
   });
 
   test("empty payload never opens a connection", async () => {
@@ -77,7 +87,7 @@ describe("resolveConfig — VERITIO_INGEST_TIMEOUT_MS (process boundary only)", 
   });
 
   test("invalid values fail closed instead of capturing with a broken bound", () => {
-    for (const bad of ["0", "-5", "abc", "1.5"]) {
+    for (const bad of ["0", "-5", "abc", "1.5", String(MAX_INGEST_TIMEOUT_MS + 1)]) {
       expect(() => resolveConfig({ ...base, VERITIO_INGEST_TIMEOUT_MS: bad } as NodeJS.ProcessEnv)).toThrow(
         "VERITIO_INGEST_TIMEOUT_MS",
       );

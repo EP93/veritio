@@ -9,6 +9,9 @@ import type { AuditEvent, EvidenceEdge } from "@veritio/core";
  */
 export const DEFAULT_INGEST_TIMEOUT_MS = 10_000;
 
+/** Hard upper bound for env and direct API callers of one remote attempt. */
+export const MAX_INGEST_TIMEOUT_MS = 30_000;
+
 /**
  * Best-effort POST of a turn's redacted events + edges to a Veritio ingest
  * endpoint, aborted after `timeoutMs` (default {@link DEFAULT_INGEST_TIMEOUT_MS})
@@ -23,11 +26,15 @@ export async function postToIngest(
   if (payload.events.length === 0 && payload.edges.length === 0) {
     return;
   }
+  const timeoutMs = ingest.timeoutMs ?? DEFAULT_INGEST_TIMEOUT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_INGEST_TIMEOUT_MS) {
+    throw new TypeError(`ingest timeout must be an integer between 1 and ${MAX_INGEST_TIMEOUT_MS} milliseconds`);
+  }
   const response = await fetch(ingest.url, {
     method: "POST",
     headers: { authorization: `Bearer ${ingest.key}`, "content-type": "application/json" },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(ingest.timeoutMs ?? DEFAULT_INGEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) {
     throw new Error(`ingest POST failed with status ${response.status}`);

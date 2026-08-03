@@ -4,8 +4,8 @@ import {
   buildCodexWrapper,
   CODEX_ENV_PATH,
   CODEX_WRAPPER_PATH,
-  codexNotifyLine,
   CREDENTIALS_PATH,
+  codexNotifyLine,
   ingestUrlFor,
   type VeritioCredentials,
 } from "./agent-config.js";
@@ -81,6 +81,8 @@ type DevicePoll =
 
 /** Injectable side effects so the flow is fully testable without real I/O. */
 export interface LoginDeps {
+  /** Absolute reviewed adapter entrypoint; never relies on an ambient global bin. */
+  codexNotifyBin: string;
   fetch: typeof fetch;
   write(message: string): void;
   writeFile(path: string, contents: string, mode: number): Promise<void>;
@@ -147,7 +149,7 @@ export async function runLogin(options: LoginOptions, deps: LoginDeps): Promise<
  */
 async function configureCodex(creds: VeritioCredentials, deps: LoginDeps): Promise<void> {
   await deps.writeFile(CODEX_ENV_PATH, buildCaptureEnv(creds), 0o600);
-  const notifyBin = "veritio-codex-notify";
+  const notifyBin = deps.codexNotifyBin;
   const existing = await deps.readCodexConfig();
   const existingNotify = existing ? extractNotify(existing) : null;
   await deps.writeFile(CODEX_WRAPPER_PATH, buildCodexWrapper(notifyBin, existingNotify), 0o755);

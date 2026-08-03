@@ -42,6 +42,7 @@ function harness(pollScript: unknown[]) {
   const written: string[] = [];
   let pollIndex = 0;
   const deps: LoginDeps = {
+    codexNotifyBin: "/workspace/adapters/codex/dist/notify.js",
     fetch: (async (url: string | URL | Request) => {
       const u = String(url);
       const body = u.endsWith("/api/device/code")
@@ -96,6 +97,8 @@ describe("runLogin device flow", () => {
     expect(files["__codex_config__"]).toContain('notify = ["');
     const wrapper = Object.entries(files).find(([p]) => p.endsWith("notify-wrapper.sh"));
     expect(wrapper![1]).toContain("/existing/notifier");
+    expect(wrapper![1]).toContain("'/workspace/adapters/codex/dist/notify.js'");
+    expect(wrapper![1]).not.toContain("'veritio-codex-notify'");
   });
 
   test("expired: exits 1 and writes no credentials", async () => {

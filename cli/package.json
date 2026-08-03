@@ -24,11 +24,12 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun run --cwd ../sdks/typescript build && bun run --cwd ../server/node build && node ../node_modules/typescript/bin/tsc -p tsconfig.json",
-    "typecheck": "bun run --cwd ../sdks/typescript build && bun run --cwd ../server/node build && node ../node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
-    "test": "bun run --cwd ../sdks/typescript build && bun run --cwd ../server/node build && bun test src"
+    "build": "bun run --cwd ../sdks/typescript build && bun run --cwd ../server/node build && bun run --cwd ../adapters/codex build && node ../node_modules/typescript/bin/tsc -p tsconfig.json",
+    "typecheck": "bun run --cwd ../sdks/typescript build && bun run --cwd ../server/node build && bun run --cwd ../adapters/codex build && node ../node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+    "test": "bun run --cwd ../sdks/typescript build && bun run --cwd ../server/node build && bun run --cwd ../adapters/codex build && bun test src"
   },
   "dependencies": {
+    "@veritio/codex": "workspace:*",
     "@veritio/core": "workspace:*",
     "@veritio/server": "workspace:*"
   }

@@ -1,17 +1,18 @@
 #!/usr/bin/env node
+import { execFile } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseExportBundle, verifyExportBundle } from "@veritio/core";
 import {
   LocalEvidenceStore,
   runIntegrationScenario,
-  startWorkbenchServer,
   type StartedWorkbenchServer,
   type StartWorkbenchServerOptions,
+  startWorkbenchServer,
 } from "@veritio/server";
-import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { type LoginDeps, parseLoginArgs, runLogin } from "./login.js";
 
 export interface DevCommandOptions {
@@ -130,6 +131,7 @@ async function runLoginCommand(args: readonly string[], dependencies: Partial<Cl
   const write = dependencies.write ?? ((message: string) => process.stdout.write(`${message}\n`));
   const codexConfigPath = join(homedir(), ".codex", "config.toml");
   const deps: LoginDeps = {
+    codexNotifyBin: resolveCodexNotifyBin(),
     fetch,
     write,
     async writeFile(path, contents, mode) {
@@ -160,6 +162,15 @@ async function runLoginCommand(args: readonly string[], dependencies: Partial<Cl
     write(error instanceof Error ? error.message : String(error));
     return { code: 1 };
   }
+}
+
+/**
+ * Resolves the declared workspace/package dependency to an absolute notify
+ * entrypoint so login never installs a wrapper around a missing global bin.
+ */
+function resolveCodexNotifyBin(): string {
+  const require = createRequire(import.meta.url);
+  return join(dirname(require.resolve("@veritio/codex")), "notify.js");
 }
 
 export interface VerifyBundleOptions {

@@ -49,6 +49,15 @@ bundler/Bun-resolved). Add to your project's `.claude/settings.json`
 
 The hook always exits `0` — a logging hook never blocks the agent.
 
+Install an exact reviewed version in repositories and hosted runners; do not
+use an unversioned `bunx` command. The bundled plugin currently pins the
+published `@veritio/claude-code@0.4.5`. The 0.4.6 source in this branch is a
+release candidate until the registry readback succeeds.
+
+The `veritio` CLI device-login helper is not published yet. From a repository
+checkout, build it with `bun run --cwd cli build` and invoke
+`bun cli/dist/index.js login claude`; do not assume a global `veritio` binary.
+
 ## Configuration (environment)
 
 Read only at the process boundary; no credential is embedded in the hook.
@@ -117,6 +126,19 @@ metadata, never event payloads or credentials. Spool payload files contain the
 same redacted, hash-only batch prepared for the wire. The queue is currently
 TypeScript-only; another capture adapter must reproduce the same disposition
 and replay-permit semantics (see `.claude/rules/02-sdk-parity.md`).
+
+### GitHub-hosted Claude Code
+
+Anthropic's GitHub Action has its own paid model/API and runner exposure. Bound
+that workflow separately with a narrow event trigger, GitHub `concurrency`, a
+job `timeout-minutes`, and Claude's `--max-turns`. Veritio's hook and spool do
+not cap Claude tokens or GitHub runner minutes.
+
+If the action is configured to load repository Claude hooks, install the exact
+reviewed `@veritio/claude-code` version before it runs and pass Veritio ingest
+credentials only through GitHub Secrets. Omit those credentials for local-only
+artifact capture. Never run the stress suite or a spool drain from a pull-request
+workflow; CI uses synthetic hooks and no paid provider credentials.
 
 ## Query + export (MCP)
 

@@ -130,6 +130,44 @@ Captured evidence keeps raw content out of storage:
 The adapter includes a read-only MCP server with tools to list sessions, inspect
 a session graph, and export a verifiable bundle.
 
+Remote delivery is bounded independently from capture: local evidence remains
+authoritative, normal hooks never replay queued batches, the queue has compiled
+hard batch/byte ceilings, and recovery requires a one-request canary followed by
+an explicitly budgeted drain. Package hooks must name an exact published
+version; `npm latest` is not a review boundary.
+
+## Codex CLI Capture
+
+The in-repo experimental `@veritio/codex` adapter maps the local Codex CLI
+`notify` callback to hash-only session and prompt records. One turn creates at
+most one ingest POST, and its timeout is constrained to 1-30 seconds. It has no
+automatic retry or backlog drain. The package and `veritio` CLI are not yet
+published, so setup is supported from a repository checkout only.
+
+Codex cloud tasks and GitHub code reviews do not expose the local CLI notify
+contract to this adapter. Do not claim they are captured. GitHub CI proves the
+adapter with synthetic notifications and no paid agent or ingest credentials.
+
+## GitHub-hosted agents
+
+Agent cost controls and Veritio delivery controls solve different problems.
+For Claude Code GitHub Actions, set a narrow trigger, workflow concurrency,
+`timeout-minutes`, and `--max-turns`; install an exact reviewed capture package
+and keep credentials in GitHub Secrets. For Codex cloud/GitHub, use the native
+product's usage limits; Veritio's local notify adapter is not an agent-spend
+limit and does not run there today.
+
+Repository verification must stay deterministic and free of paid calls:
+
+```sh
+bun run verify:agent-integrations
+bun run --cwd adapters/claude-code test
+bun run --cwd adapters/codex test
+```
+
+Never run delivery stress, a production canary, or a spool drain from an
+untrusted pull-request workflow.
+
 ## Local Agent Check
 
 Start the local Workbench and MCP endpoint:

@@ -4,6 +4,34 @@ All notable changes to Veritio will be documented in this file.
 
 Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while the protocol, SDKs, adapters, and storage contracts settle. Release notes should be explicit about migration steps and should avoid legal-compliance guarantees.
 
+## [0.4.6] - 2026-08-03
+
+### Added
+
+- Claude Code remote delivery now has a finite durable queue, sticky pause,
+  quarantine, one-request canary, and explicitly budgeted manual drains. Normal
+  hooks never auto-replay backlog after an outage or quota upgrade.
+- CI now verifies the Claude plugin package pin, the core/storage/Claude release
+  train, disabled-by-default hosted plugin state, and the Codex remote-attempt
+  ceiling before the main suite.
+
+### Changed
+
+- Prepared `@veritio/core`, `@veritio/storage`, and `@veritio/claude-code`
+  0.4.6 together with exact internal pins. Publishing still requires the guarded
+  release script and a short-lived npm token after merge.
+- The Claude plugin pins the currently published, reviewed
+  `@veritio/claude-code@0.4.5` instead of resolving npm latest on every hook.
+  Move the pin to 0.4.6 only after the registry confirms that release.
+- The experimental, still-unpublished `@veritio/codex` workspace package moves
+  to 0.0.2 and rejects both env and direct-call ingest timeouts above 30 seconds.
+
+### Safety
+
+- Local and GitHub-hosted guidance now separates agent model/API budgets from
+  Veritio delivery budgets. Veritio capture is local-first; production stress
+  and automatic backlog drains are explicitly excluded.
+
 ## [0.4.4] - 2026-08-02
 
 ### Changed

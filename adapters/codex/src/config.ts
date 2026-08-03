@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { MAX_INGEST_TIMEOUT_MS } from "./ingest.js";
+
 /**
  * Resolved Codex adapter configuration. Mirrors `@veritio/claude-code`: the
  * local file store is always the working sink; when both an ingest URL and key
@@ -63,8 +65,8 @@ function parseIngestTimeout(raw: string | undefined): number | undefined {
     return undefined;
   }
   const value = Number(trimmed);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error("VERITIO_INGEST_TIMEOUT_MS must be a positive integer of milliseconds");
+  if (!Number.isInteger(value) || value <= 0 || value > MAX_INGEST_TIMEOUT_MS) {
+    throw new Error(`VERITIO_INGEST_TIMEOUT_MS must be an integer between 1 and ${MAX_INGEST_TIMEOUT_MS} milliseconds`);
   }
   return value;
 }
