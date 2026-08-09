@@ -285,6 +285,35 @@ describe("risk signal derivation", () => {
     });
     expect(recursive.toolCall.riskSignals).toMatchObject({ operationType: "destructive" });
   });
+
+  // 2026-07-18 review: long-form/aliased recursive deletes evaded the
+  // destructive class (rm --recursive fell through to delete; rimraf and
+  // find -delete attached no signal at all).
+  test("long-form and aliased recursive deletes classify as destructive", () => {
+    const commands = [
+      "rm --recursive old-dir",
+      "rm --force --recursive old-dir",
+      "npx rimraf dist",
+      "find . -name '*.tmp' -delete",
+    ];
+    for (const [seq, command] of commands.entries()) {
+      const { toolCall } = buildToolCall(payload({ tool_name: "Bash", tool_input: { command } }), config, {
+        seq,
+        now: NOW,
+        status: "succeeded",
+        preImages: {},
+        afterHashes: {},
+      });
+      expect(toolCall.riskSignals).toMatchObject({ operationType: "destructive", reversibility: "irreversible" });
+    }
+    // A pipeline segment must not smear flags onto an unrelated leading command.
+    const piped = buildToolCall(
+      payload({ tool_name: "Bash", tool_input: { command: "ls | grep --recursive foo" } }),
+      config,
+      { seq: 9, now: NOW, status: "succeeded", preImages: {}, afterHashes: {} },
+    );
+    expect(piped.toolCall.riskSignals).toBeUndefined();
+  });
 });
 
 describe("refreshContextScope", () => {

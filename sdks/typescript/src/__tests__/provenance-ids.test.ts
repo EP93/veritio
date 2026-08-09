@@ -44,9 +44,10 @@ const fixture = (await Bun.file(
   }[];
   defaultEventIdCases: {
     name: string;
-    kind: string;
-    sourceTreeId: string;
-    resultVersion: number;
+    kind: "file_change" | "tool";
+    sourceTreeId?: string;
+    resultVersion?: number | null;
+    toolCallId?: string;
     expected: string;
   }[];
 };
@@ -152,12 +153,23 @@ describe("provenance id conformance (spec/conformance/provenance-ids.json)", () 
     }
   });
 
-  test("default file-change event id derives from source tree and result version", async () => {
+  test("default event ids: file-change (present + absent resultVersion sentinel) and tool occurrence", async () => {
     const session = await startFixtureSession();
     for (const eventCase of fixture.defaultEventIdCases) {
+      if (eventCase.kind === "tool") {
+        const result = await session.recordToolCall({
+          toolCallId: eventCase.toolCallId as string,
+          tool: "fixture_tool",
+          status: "succeeded",
+          occurredAt: "2026-07-16T00:03:00.000Z",
+        });
+        expect(result.event.event.id).toBe(eventCase.expected);
+        continue;
+      }
       const result = await session.recordFileChange({
-        sourceTreeId: eventCase.sourceTreeId,
-        resultVersion: eventCase.resultVersion,
+        sourceTreeId: eventCase.sourceTreeId as string,
+        // A null fixture resultVersion pins the absent-field `x` sentinel.
+        ...(eventCase.resultVersion === null ? {} : { resultVersion: eventCase.resultVersion }),
         occurredAt: "2026-07-16T00:03:00.000Z",
         files: [
           {
