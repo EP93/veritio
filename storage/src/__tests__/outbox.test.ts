@@ -5,13 +5,17 @@ import { join } from "node:path";
 
 import { type AuditEventInput, createGovernedChangeDraft, defineEntity, type EvidenceEdgeInput } from "@veritio/core";
 import { createFileEvidenceStore, type FileEvidenceStore } from "../file-store";
+import { DEFAULT_DELIVERY_SAFETY_POLICY } from "../delivery-safety";
 import {
   createFileOutboxAdapter,
   createOutboxDispatcher,
   createPostgresOutboxAdapter,
+  createRollingWindowLedger,
   dispatchOutboxEntry,
   MYSQL_OUTBOX_SCHEMA_SQL,
   type OutboxEvidenceTarget,
+  outboxPayloadByteLength,
+  OutboxQueueFullError,
   type OutboxStoredEntry,
   POSTGRES_OUTBOX_SCHEMA_SQL,
   type SqlOutboxExecutor,
@@ -584,3 +588,82 @@ function limitRows(rows: SqlOutboxRow[], limit: unknown): SqlOutboxRow[] {
   );
   return limit === null || limit === undefined ? sorted : sorted.slice(0, Number(limit));
 }
+
+describe("file outbox queued-bytes ceiling", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "veritio-outbox-cap-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("enqueue fails closed once the undelivered backlog would exceed the cap", async () => {
+    const payload = makeDraft("cap").outboxEntry;
+    const entryBytes = outboxPayloadByteLength(payload);
+    const adapter = createFileOutboxAdapter(join(dir, "outbox"), { maxQueuedBytes: entryBytes + 10 });
+
+    await adapter.transaction((tx) => tx.enqueue({ id: "cap_1", tenantId: TENANT, payload }));
+    await expect(
+      adapter.transaction((tx) =>
+        tx.enqueue({ id: "cap_2", tenantId: TENANT, payload: makeDraft("cap2").outboxEntry }),
+      ),
+    ).rejects.toThrow(OutboxQueueFullError);
+    // The refused enqueue rolled back: only the first durable copy exists.
+    expect(await adapter.list({ tenantId: TENANT })).toHaveLength(1);
+
+    // Idempotent re-enqueue of the SAME entry stays accepted at the ceiling.
+    await adapter.transaction((tx) => tx.enqueue({ id: "cap_1", tenantId: TENANT, payload }));
+    expect(await adapter.list({ tenantId: TENANT })).toHaveLength(1);
+  });
+
+  test("dispatched rows leave the backlog so delivery restores capacity", async () => {
+    const payload = makeDraft("drain").outboxEntry;
+    const entryBytes = outboxPayloadByteLength(payload);
+    const path = join(dir, "outbox");
+    const adapter = createFileOutboxAdapter(path, { maxQueuedBytes: entryBytes + 10 });
+    await adapter.transaction((tx) => tx.enqueue({ id: "drain_1", tenantId: TENANT, payload }));
+
+    const evidence = createFileEvidenceStore(join(dir, "evidence"));
+    const dispatcher = createOutboxDispatcher({ adapter, target: evidence });
+    expect((await dispatcher.dispatchBatch({ tenantId: TENANT, permit: PERMIT })).dispatched).toBe(1);
+
+    await adapter.transaction((tx) =>
+      tx.enqueue({ id: "drain_2", tenantId: TENANT, payload: makeDraft("d2").outboxEntry }),
+    );
+    expect(await adapter.list({ tenantId: TENANT })).toHaveLength(2);
+  });
+
+  test("rejects a non-positive ceiling at construction", () => {
+    expect(() => createFileOutboxAdapter(join(dir, "outbox"), { maxQueuedBytes: 0 })).toThrow("maxQueuedBytes");
+  });
+});
+
+describe("rolling window ledger", () => {
+  const policy = {
+    ...DEFAULT_DELIVERY_SAFETY_POLICY,
+    hard: { ...DEFAULT_DELIVERY_SAFETY_POLICY.hard, rollingRequests: 2, rollingSendBytes: 300, windowMs: 1_000 },
+  };
+
+  test("caps requests and bytes across recorded sends", () => {
+    const ledger = createRollingWindowLedger(policy);
+    expect(ledger.remainingRequests(0)).toBe(2);
+    expect(ledger.remainingBytes(0)).toBe(300);
+    ledger.record(0, 100);
+    ledger.record(10, 150);
+    expect(ledger.remainingRequests(20)).toBe(0);
+    expect(ledger.remainingBytes(20)).toBe(50);
+  });
+
+  test("restores capacity only after sends age out of the window", () => {
+    const ledger = createRollingWindowLedger(policy);
+    ledger.record(0, 200);
+    ledger.record(500, 100);
+    expect(ledger.remainingRequests(999)).toBe(0);
+    // The first send ages out exactly at windowMs; the second remains.
+    expect(ledger.remainingRequests(1_000)).toBe(1);
+    expect(ledger.remainingBytes(1_000)).toBe(200);
+    expect(ledger.remainingRequests(1_500)).toBe(2);
+    expect(ledger.remainingBytes(1_500)).toBe(300);
+  });
+});

@@ -16,6 +16,7 @@ import {
   createFileOutboxAdapter,
   createHttpIngestTarget,
   createHttpOutboxDispatcher,
+  DEFAULT_DELIVERY_SAFETY_POLICY,
   type OutboxAdapter,
   type OutboxDispatcher,
 } from "@veritio/storage";
@@ -95,7 +96,14 @@ export async function startGateway(options: StartGatewayOptions = {}): Promise<S
     let ingestDispatcher: OutboxDispatcher | undefined;
     let ingestOutbox: OutboxAdapter | undefined;
     if (config.ingest !== undefined) {
-      const outbox = createFileOutboxAdapter(join(config.evidenceDir, "outbox"));
+      // The ship-out outbox is hard-bounded: in the default `held` startup
+      // mode nothing drains it, so without this ceiling a long-lived gateway
+      // would grow entries.json until the evidence volume fills. Once full,
+      // new remote-delivery copies are refused (sink logs the hold) while the
+      // authoritative local store keeps recording.
+      const outbox = createFileOutboxAdapter(join(config.evidenceDir, "outbox"), {
+        maxQueuedBytes: DEFAULT_DELIVERY_SAFETY_POLICY.hard.queuedBytes,
+      });
       ingestOutbox = outbox;
       store = createShipOutSink(localStore, { outbox, tenantId: config.tenantId });
       ingestDispatcher = createHttpOutboxDispatcher({

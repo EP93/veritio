@@ -201,15 +201,52 @@ describe("http ingest target", () => {
     expect(String(error)).not.toContain(KEY);
   });
 
-  test("does not trust pause-shaped metadata without the economic hold code", async () => {
+  test("an explicit pause disposition holds delivery regardless of its code", async () => {
+    // Portable contract: a conforming self-hosted target signals pause via
+    // deliveryDisposition alone (e.g. operator_pause); requiring the hosted
+    // economic_safety_hold code would silently downgrade it to plain retry.
     const { impl } = fetchReturning({
       status: 503,
-      body: { deliveryDisposition: "pause", retryable: false, circuitId: "forged" },
+      body: { deliveryDisposition: "pause", code: "operator_pause", circuitId: "circuit_op" },
+    });
+    const target = createHttpIngestTarget({ baseUrl: BASE_URL, key: KEY, fetchImpl: impl });
+    const error = await target.dispatchEntry(payloadOf(1, 0)).catch((caught) => caught);
+    expect(error).toBeInstanceOf(IngestPausedError);
+    expect((error as IngestPausedError).disposition).toBe("pause");
+    expect((error as IngestPausedError).circuitId).toBe("circuit_op");
+  });
+
+  test("an explicit retry disposition on a 4xx status stays retryable", async () => {
+    const { impl } = fetchReturning({
+      status: 429,
+      body: { deliveryDisposition: "retry", code: "rate_limited" },
     });
     const target = createHttpIngestTarget({ baseUrl: BASE_URL, key: KEY, fetchImpl: impl });
     const error = await target.dispatchEntry(payloadOf(1, 0)).catch((caught) => caught);
     expect(error).toBeInstanceOf(IngestRetryableError);
     expect((error as IngestRetryableError).disposition).toBe("retry");
+  });
+
+  test("an explicit reject disposition is terminal without the legacy retryable field", async () => {
+    const { impl } = fetchReturning({
+      status: 500,
+      body: { deliveryDisposition: "reject", code: "derived_processing_failed" },
+    });
+    const target = createHttpIngestTarget({ baseUrl: BASE_URL, key: KEY, fetchImpl: impl });
+    const error = await target.dispatchEntry(payloadOf(1, 0)).catch((caught) => caught);
+    expect(error).toBeInstanceOf(IngestRejectedError);
+    expect((error as IngestRejectedError).disposition).toBe("reject");
+  });
+
+  test("a known legacy pause code without a disposition field still pauses", async () => {
+    const { impl } = fetchReturning({
+      status: 503,
+      body: { code: "tenant_db_quota_blocked", circuitId: "circuit_quota" },
+    });
+    const target = createHttpIngestTarget({ baseUrl: BASE_URL, key: KEY, fetchImpl: impl });
+    const error = await target.dispatchEntry(payloadOf(1, 0)).catch((caught) => caught);
+    expect(error).toBeInstanceOf(IngestPausedError);
+    expect((error as IngestPausedError).circuitId).toBe("circuit_quota");
   });
 
   test("aborts a hanging fetch at the finite configured timeout", async () => {
@@ -388,6 +425,97 @@ describe("http outbox dispatcher", () => {
     expect(await adapter.resumePaused({ tenantId: "proj_1", expectedCircuitId: "circuit_1", limit: 10 })).toBe(1);
     expect((await second.dispatchBatch({ tenantId: "proj_1", permit: permit("resumed") })).dispatched).toBe(2);
     expect(wouldSucceed.calls).toHaveLength(2);
+  });
+
+  test("the rolling request ceiling holds across repeated one-entry permits", async () => {
+    const adapter = createFileOutboxAdapter(join(dir, "outbox"));
+    await adapter.transaction(async (tx) => {
+      for (let index = 0; index < 3; index += 1) {
+        await tx.enqueue({ id: `rolling_${index}`, tenantId: "proj_1", payload: payloadOf(1, 0) });
+      }
+    });
+    const ok = fetchReturning({ status: 200, body: { appended: { events: 1, edges: 0 } } });
+    const deliverySafety = {
+      recommended: { queuedBytes: 1_000_000, rollingSendBytes: 1_000_000 },
+      hard: {
+        batchBytes: 1_000_000,
+        queuedBytes: 2_000_000,
+        rollingSendBytes: 1_000_000,
+        rollingRequests: 2,
+        windowMs: 60_000,
+        automaticReplayBatches: 1 as const,
+      },
+    };
+    const dispatcher = createHttpOutboxDispatcher({
+      adapter,
+      target: createHttpIngestTarget({ baseUrl: BASE_URL, key: KEY, fetchImpl: ok.impl }),
+      deliverySafety,
+    });
+    const onePermit = (id: string) => ({ ...permit(id), maxEntries: 1, maxBytes: 1_000_000 });
+    expect((await dispatcher.dispatchBatch({ tenantId: "proj_1", permit: onePermit("roll-1") })).dispatched).toBe(1);
+    expect((await dispatcher.dispatchBatch({ tenantId: "proj_1", permit: onePermit("roll-2") })).dispatched).toBe(1);
+    // Third pass inside the same window: the cross-pass ledger refuses more work.
+    expect((await dispatcher.dispatchBatch({ tenantId: "proj_1", permit: onePermit("roll-3") })).dispatched).toBe(0);
+    expect(ok.calls).toHaveLength(2);
+    expect((await adapter.list({ tenantId: "proj_1", limit: 3 })).filter((e) => e.status === "pending")).toHaveLength(
+      1,
+    );
+  });
+
+  test("the rolling byte ceiling holds across repeated permits", async () => {
+    const adapter = createFileOutboxAdapter(join(dir, "outbox"));
+    const payload = payloadOf(1, 0);
+    const entryBytes = new TextEncoder().encode(
+      JSON.stringify({ events: payload.records, edges: payload.edges }),
+    ).byteLength;
+    await adapter.transaction(async (tx) => {
+      await tx.enqueue({ id: "bytes_1", tenantId: "proj_1", payload });
+      await tx.enqueue({ id: "bytes_2", tenantId: "proj_1", payload: payloadOf(1, 0) });
+    });
+    const ok = fetchReturning({ status: 200, body: { appended: { events: 1, edges: 0 } } });
+    const rollingSendBytes = entryBytes + 5; // one entry fits, a second cannot
+    const dispatcher = createHttpOutboxDispatcher({
+      adapter,
+      target: createHttpIngestTarget({ baseUrl: BASE_URL, key: KEY, fetchImpl: ok.impl }),
+      deliverySafety: {
+        recommended: { queuedBytes: rollingSendBytes, rollingSendBytes },
+        hard: {
+          batchBytes: rollingSendBytes,
+          queuedBytes: 2_000_000,
+          rollingSendBytes,
+          rollingRequests: 30,
+          windowMs: 60_000,
+          automaticReplayBatches: 1 as const,
+        },
+      },
+    });
+    const bytePermit = (id: string) => ({ ...permit(id), maxBytes: rollingSendBytes });
+    expect((await dispatcher.dispatchBatch({ tenantId: "proj_1", permit: bytePermit("byte-1") })).dispatched).toBe(1);
+    expect((await dispatcher.dispatchBatch({ tenantId: "proj_1", permit: bytePermit("byte-2") })).dispatched).toBe(0);
+    expect(ok.calls).toHaveLength(1);
+  });
+
+  test("clamps the in-flight request to the permit deadline", async () => {
+    const adapter = createFileOutboxAdapter(join(dir, "outbox"));
+    await adapter.transaction((tx) => tx.enqueue({ id: "slow", tenantId: "proj_1", payload: payloadOf(1, 0) }));
+    const hanging = (async (_url: string | URL | Request, init?: RequestInit) => {
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    }) as typeof fetch;
+    const dispatcher = createHttpOutboxDispatcher({
+      adapter,
+      // The target keeps its default 10-second timeout; the permit is shorter.
+      target: createHttpIngestTarget({ baseUrl: BASE_URL, key: KEY, fetchImpl: hanging }),
+    });
+    const started = Date.now();
+    const result = await dispatcher.dispatchBatch({
+      tenantId: "proj_1",
+      permit: { ...permit("deadline"), maxElapsedMs: 50, leaseMs: 200 },
+    });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(result).toMatchObject({ dispatched: 0, retried: 1 });
+    expect((await adapter.list({ tenantId: "proj_1" }))[0]).toMatchObject({ status: "pending", attempts: 1 });
   });
 
   test("50 concurrent dispatchers claim one row exactly once", async () => {

@@ -29,20 +29,52 @@ import type {
   OutboxTransaction,
 } from "./outbox-types.js";
 
+/**
+ * Typed enqueue refusal once the durable undelivered backlog would exceed the
+ * configured byte ceiling. Callers treating enqueue as best-effort (gateway
+ * ship-out) drop only the REMOTE copy and keep the authoritative local record.
+ */
+export class OutboxQueueFullError extends Error {
+  /** Carries no queue contents; the ceiling itself is the whole message. */
+  constructor(maxQueuedBytes: number) {
+    super(`outbox backlog reached the ${maxQueuedBytes}-byte ceiling; drain or resume delivery before enqueueing`);
+    this.name = "OutboxQueueFullError";
+  }
+}
+
+export interface FileOutboxAdapterOptions {
+  /**
+   * Hard byte ceiling over every undelivered row (pending, leased, paused,
+   * dead). When a new enqueue would cross it, `enqueue` throws
+   * {@link OutboxQueueFullError} instead of growing the snapshot without
+   * bound — a disconnected or held drain must not consume the volume.
+   * Omitted means unbounded (pre-existing behavior for host-managed queues).
+   */
+  maxQueuedBytes?: number;
+}
+
 /** Creates the process-safe file outbox used by local and self-hosted flows. */
-export function createFileOutboxAdapter(dir: string): OutboxAdapter {
-  return new FileOutboxAdapter(dir);
+export function createFileOutboxAdapter(dir: string, options: FileOutboxAdapterOptions = {}): OutboxAdapter {
+  return new FileOutboxAdapter(dir, options);
 }
 
 /** File-backed outbox with atomic snapshots and crash-recoverable claims. */
 class FileOutboxAdapter implements OutboxAdapter {
   readonly #dir: string;
   readonly #path: string;
+  readonly #maxQueuedBytes: number | undefined;
 
   /** Stores paths without creating files for read-only callers. */
-  constructor(dir: string) {
+  constructor(dir: string, options: FileOutboxAdapterOptions = {}) {
+    if (
+      options.maxQueuedBytes !== undefined &&
+      (!Number.isSafeInteger(options.maxQueuedBytes) || options.maxQueuedBytes <= 0)
+    ) {
+      throw new TypeError("maxQueuedBytes must be a positive safe integer");
+    }
     this.#dir = dir;
     this.#path = join(dir, "entries.json");
+    this.#maxQueuedBytes = options.maxQueuedBytes;
   }
 
   /** Commits staged enqueues only after the host callback succeeds. */
@@ -57,6 +89,14 @@ class FileOutboxAdapter implements OutboxAdapter {
           if (existing) {
             if (!sameEnqueueInput(existing, entry)) throw new TypeError("outbox idempotency conflict");
             return cloneEntry(existing);
+          }
+          if (this.#maxQueuedBytes !== undefined) {
+            const backlog = staged
+              .filter((candidate) => candidate.status !== "dispatched")
+              .reduce((total, candidate) => total + outboxPayloadByteLength(candidate.payload), 0);
+            if (backlog + outboxPayloadByteLength(entry.payload) > this.#maxQueuedBytes) {
+              throw new OutboxQueueFullError(this.#maxQueuedBytes);
+            }
           }
           staged.push(entry);
           staged.sort(compareEntries);

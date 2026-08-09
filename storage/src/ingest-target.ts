@@ -1,6 +1,7 @@
 import type { AuditEventInput, EvidenceEdgeInput } from "@veritio/core";
 import { type DeliveryDisposition, type DeliverySafetyPolicy, parseDeliverySafetyPolicy } from "./delivery-safety.js";
 import {
+  createRollingWindowLedger,
   dispatchLeaseId,
   emptyDispatchResult,
   type OutboxAdapter,
@@ -157,7 +158,17 @@ export interface HttpIngestTarget {
   /** Sends one already-minimized batch within the configured byte and time bounds. */
   postBatch(batch: IngestBatch): Promise<IngestResult>;
   /** Sends one durable outbox payload as exactly one HTTP request. */
-  dispatchEntry(payload: OutboxPayload): Promise<IngestResult>;
+  dispatchEntry(payload: OutboxPayload, options?: DispatchEntryOptions): Promise<IngestResult>;
+}
+
+/** Per-attempt delivery bounds a dispatcher may tighten below the target default. */
+export interface DispatchEntryOptions {
+  /**
+   * Finite abort bound for this one attempt. It can only LOWER the target's
+   * configured timeout — a dispatch pass must never outlive its permit, so the
+   * dispatcher clamps each in-flight request to the permit time remaining.
+   */
+  timeoutMs?: number;
 }
 
 export interface HttpIngestTargetOptions {
@@ -200,7 +211,11 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
    * typed, sanitized error. Returns early without a network call for an empty
    * batch so dispatching an edge-only or empty entry is cheap.
    */
-  async function postBatchWithMode(batch: IngestBatch, delivery: "live-v1" | "replay-v1"): Promise<IngestResult> {
+  async function postBatchWithMode(
+    batch: IngestBatch,
+    delivery: "live-v1" | "replay-v1",
+    attemptTimeoutMs: number = timeoutMs,
+  ): Promise<IngestResult> {
     if (batch.events.length === 0 && batch.edges.length === 0) {
       return EMPTY_RESULT;
     }
@@ -217,7 +232,7 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
         "x-veritio-delivery": delivery,
       },
       body: requestBody,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: AbortSignal.timeout(attemptTimeoutMs),
     });
 
     const body = await safeJson(response);
@@ -226,18 +241,22 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
     }
 
     const appended = extractAppended(body);
-    const pause = extractEconomicSafetyPause(body);
-    if (pause !== null) {
-      throw new IngestPausedError(response.status, { appended, ...pause });
+    // A validated portable disposition is authoritative; code and HTTP status
+    // are legacy fallbacks only. This mirrors the claude-code capture
+    // adapter's failure contract so every conforming target — hosted or
+    // self-hosted — controls retry/pause/reject the same way.
+    const disposition = extractDeliveryDisposition(body, response.status);
+    if (disposition === "pause") {
+      throw new IngestPausedError(response.status, { appended, ...extractPauseControls(body) });
     }
-    if (extractExplicitRejection(body)) {
+    if (disposition === "retry") {
+      throw new IngestRetryableError(response.status, appended);
+    }
+    if (explicitDisposition(body) === "reject") {
       throw new IngestRejectedError(response.status, appended);
     }
     if (response.status === 409) {
       throw new IngestConflictError(appended);
-    }
-    if (response.status >= 500) {
-      throw new IngestRetryableError(response.status, appended);
     }
     throw new IngestClientError(response.status, appended);
   }
@@ -247,13 +266,18 @@ export function createHttpIngestTarget(options: HttpIngestTargetOptions): HttpIn
       return postBatchWithMode(batch, "live-v1");
     },
     /**
-     * Delivers one outbox payload as a single POST of its records + edges.
+     * Delivers one outbox payload as a single POST of its records + edges,
+     * optionally clamped to a caller-supplied finite per-attempt bound.
      */
-    dispatchEntry(payload: OutboxPayload): Promise<IngestResult> {
+    dispatchEntry(payload: OutboxPayload, options: DispatchEntryOptions = {}): Promise<IngestResult> {
       if (!payload || !Array.isArray(payload.records) || !Array.isArray(payload.edges)) {
         throw new TypeError("outbox payload must contain records and edges arrays");
       }
-      return postBatchWithMode({ events: payload.records, edges: payload.edges }, "replay-v1");
+      const attemptTimeoutMs =
+        options.timeoutMs === undefined
+          ? timeoutMs
+          : Math.min(timeoutMs, requirePositiveInteger(options.timeoutMs, "timeoutMs"));
+      return postBatchWithMode({ events: payload.records, edges: payload.edges }, "replay-v1", attemptTimeoutMs);
     },
   };
 }
@@ -271,6 +295,9 @@ export function createHttpOutboxDispatcher(options: {
   deliverySafety?: DeliverySafetyPolicy;
 }): OutboxDispatcher {
   const deliverySafety = parseDeliverySafetyPolicy(options.deliverySafety);
+  // Rolling request/byte accounting survives across passes (per instance) so
+  // repeated one-entry permits cannot bypass the hard window ceilings.
+  const ledger = createRollingWindowLedger(deliverySafety);
   return {
     async dispatchBatch(dispatchOptions) {
       validateDispatchOptions(dispatchOptions, deliverySafety);
@@ -278,7 +305,11 @@ export function createHttpOutboxDispatcher(options: {
       const startedAt = Date.now();
       for (let index = 0; index < dispatchOptions.permit.maxEntries; index += 1) {
         if (Date.now() - startedAt >= dispatchOptions.permit.maxElapsedMs) break;
-        const remainingBytes = dispatchOptions.permit.maxBytes - result.bytes;
+        if (ledger.remainingRequests(Date.now()) <= 0) break;
+        const remainingBytes = Math.min(
+          dispatchOptions.permit.maxBytes - result.bytes,
+          ledger.remainingBytes(Date.now()),
+        );
         if (remainingBytes <= 0) break;
         const leaseId = dispatchLeaseId(dispatchOptions.permit, index);
         const [entry] = await options.adapter.claimDispatchable({
@@ -290,9 +321,14 @@ export function createHttpOutboxDispatcher(options: {
           maxPayloadBytes: Math.min(remainingBytes, deliverySafety.hard.batchBytes),
         });
         if (!entry) break;
+        ledger.record(Date.now(), outboxPayloadByteLength(entry.payload));
         result.bytes += outboxPayloadByteLength(entry.payload);
         try {
-          await options.target.dispatchEntry(entry.payload);
+          // The in-flight request is clamped to the permit time remaining so a
+          // slow target cannot make the pass outlive its permit or its lease.
+          await options.target.dispatchEntry(entry.payload, {
+            timeoutMs: Math.max(1, dispatchOptions.permit.maxElapsedMs - (Date.now() - startedAt)),
+          });
           await options.adapter.markDispatched(
             entry.id,
             dispatchOptions.now === undefined
@@ -365,25 +401,47 @@ function extractAppended(body: unknown): { events: number; edges: number } | und
 }
 
 /**
- * Trusts a terminal response only when both portable control fields agree.
- * This lets a server report post-commit derived-processing failure without a
- * 5xx status fallback teaching clients to replay already-committed evidence.
+ * Stable codes that legacy responses used to signal an operator-controlled
+ * hold before the portable `deliveryDisposition` field existed. Kept in sync
+ * with the claude-code capture adapter's `LEGACY_PAUSE_CODES`.
  */
-function extractExplicitRejection(body: unknown): boolean {
-  return isRecord(body) && body.deliveryDisposition === "reject" && body.retryable === false;
+const LEGACY_PAUSE_CODES = new Set([
+  "economic_safety_hold",
+  "monthly_event_quota_exceeded",
+  "operator_pause",
+  "provider_block",
+  "tenant_db_quota_blocked",
+]);
+
+/** Returns the response's validated portable disposition, or null when absent. */
+function explicitDisposition(body: unknown): DeliveryDisposition | null {
+  if (!isRecord(body)) return null;
+  const value = body.deliveryDisposition;
+  return value === "retry" || value === "pause" || value === "reject" ? value : null;
 }
 
 /**
- * Accepts pause metadata only for the exact hosted economic-safety code and
- * validated bounded fields, preventing arbitrary server text from entering SDK
- * state or changing generic 5xx retry semantics.
+ * Resolves the three-way delivery verdict for a non-2xx response. A validated
+ * body `deliveryDisposition` wins outright — a conforming target's explicit
+ * pause or retry must not be overridden by its HTTP status — then a known
+ * legacy pause code, then the status-only mapping (5xx retry, 4xx reject).
  */
-function extractEconomicSafetyPause(
-  body: unknown,
-): { circuitId?: string | undefined; retryAfterSeconds?: number | undefined } | null {
-  if (!isRecord(body) || body.code !== "economic_safety_hold" || body.deliveryDisposition !== "pause") {
-    return null;
-  }
+function extractDeliveryDisposition(body: unknown, status: number): DeliveryDisposition {
+  const explicit = explicitDisposition(body);
+  if (explicit !== null) return explicit;
+  if (isRecord(body) && typeof body.code === "string" && LEGACY_PAUSE_CODES.has(body.code)) return "pause";
+  return status >= 500 ? "retry" : "reject";
+}
+
+/**
+ * Extracts only bounded, sanitized pause control fields so arbitrary server
+ * text can never enter SDK state alongside a hold.
+ */
+function extractPauseControls(body: unknown): {
+  circuitId?: string | undefined;
+  retryAfterSeconds?: number | undefined;
+} {
+  if (!isRecord(body)) return {};
   const result: { circuitId?: string; retryAfterSeconds?: number } = {};
   if (typeof body.circuitId === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(body.circuitId)) {
     result.circuitId = body.circuitId;

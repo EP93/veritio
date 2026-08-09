@@ -96,6 +96,24 @@ describe("createShipOutSink", () => {
     expect(warned).toEqual([record.event.id]);
   });
 
+  test("a full outbox drops only the remote copy and reports the hold reason", async () => {
+    const { evidenceDir, outboxDir } = tempDirs();
+    const store = createFileEvidenceStore(evidenceDir);
+    // A ceiling smaller than one gateway event: the very first enqueue holds.
+    const outbox = createFileOutboxAdapter(outboxDir, { maxQueuedBytes: 10 });
+    const warned: Array<{ eventId: string; reason: string }> = [];
+    const sink = createShipOutSink(store, {
+      outbox,
+      tenantId: CFG.tenantId,
+      onEnqueueError: (eventId, reason) => warned.push({ eventId, reason }),
+    });
+
+    const record = await sink.recordEvent(buildOutcomeEvent(outcome("req_1"), CFG));
+    expect(record.sequence).toBe(1); // authoritative local append still succeeded
+    expect(warned).toEqual([{ eventId: record.event.id, reason: "queue_full" }]);
+    expect(await outbox.listDispatchable()).toHaveLength(0);
+  });
+
   test("outbox drains to an ingest endpoint via the HTTP dispatcher; failures stay pending", async () => {
     const { evidenceDir, outboxDir } = tempDirs();
     const store = createFileEvidenceStore(evidenceDir);

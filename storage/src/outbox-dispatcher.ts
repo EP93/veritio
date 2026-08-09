@@ -14,6 +14,47 @@ import type {
   OutboxPayload,
 } from "./outbox-types.js";
 
+/**
+ * Durable-window transport accounting shared by every dispatch pass of one
+ * dispatcher instance. Permits only authorize a single pass; the ledger is
+ * what makes `hard.rollingRequests` / `hard.rollingSendBytes` hold ACROSS
+ * passes, so a caller looping one-entry permits cannot bypass the ceiling.
+ * Scope boundary: the ledger is per dispatcher instance (per process). The
+ * per-tenant single active lease serializes concurrent dispatchers, and the
+ * server-side economic-safety circuit is the cross-process backstop.
+ */
+export interface RollingWindowLedger {
+  /** Requests still permitted inside the current rolling window. */
+  remainingRequests(now: number): number;
+  /** Bytes still permitted inside the current rolling window. */
+  remainingBytes(now: number): number;
+  /** Reserves one delivery attempt of `bytes` before the send happens. */
+  record(now: number, bytes: number): void;
+}
+
+/** Creates a rolling request/byte ledger over the policy's hard window. */
+export function createRollingWindowLedger(policy: Readonly<DeliverySafetyPolicy>): RollingWindowLedger {
+  let sends: Array<{ at: number; bytes: number }> = [];
+  /** Drops attempts that have aged out of the rolling window. */
+  const prune = (now: number): void => {
+    sends = sends.filter((send) => now - send.at < policy.hard.windowMs);
+  };
+  return {
+    remainingRequests(now) {
+      prune(now);
+      return policy.hard.rollingRequests - sends.length;
+    },
+    remainingBytes(now) {
+      prune(now);
+      return policy.hard.rollingSendBytes - sends.reduce((total, send) => total + send.bytes, 0);
+    },
+    record(now, bytes) {
+      prune(now);
+      sends.push({ at: now, bytes });
+    },
+  };
+}
+
 /** Creates a bounded lease-aware dispatcher for a local evidence target. */
 export function createOutboxDispatcher(options: {
   adapter: OutboxAdapter;
@@ -21,6 +62,7 @@ export function createOutboxDispatcher(options: {
   deliverySafety?: DeliverySafetyPolicy;
 }): OutboxDispatcher {
   const policy = parseDeliverySafetyPolicy(options.deliverySafety);
+  const ledger = createRollingWindowLedger(policy);
   return {
     async dispatchBatch(dispatchOptions) {
       validateDispatchOptions(dispatchOptions, policy);
@@ -28,7 +70,11 @@ export function createOutboxDispatcher(options: {
       const startedAt = Date.now();
       for (let index = 0; index < dispatchOptions.permit.maxEntries; index += 1) {
         if (Date.now() - startedAt >= dispatchOptions.permit.maxElapsedMs) break;
-        const remainingBytes = dispatchOptions.permit.maxBytes - result.bytes;
+        if (ledger.remainingRequests(Date.now()) <= 0) break;
+        const remainingBytes = Math.min(
+          dispatchOptions.permit.maxBytes - result.bytes,
+          ledger.remainingBytes(Date.now()),
+        );
         if (remainingBytes <= 0) break;
         const [entry] = await options.adapter.claimDispatchable({
           tenantId: dispatchOptions.tenantId,
@@ -39,7 +85,9 @@ export function createOutboxDispatcher(options: {
           maxPayloadBytes: Math.min(remainingBytes, policy.hard.batchBytes),
         });
         if (!entry) break;
-        result.bytes += outboxPayloadByteLength(entry.payload);
+        const entryBytes = outboxPayloadByteLength(entry.payload);
+        ledger.record(Date.now(), entryBytes);
+        result.bytes += entryBytes;
         try {
           await dispatchOutboxEntry(entry.payload, options.target);
           await options.adapter.markDispatched(

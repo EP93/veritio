@@ -309,12 +309,17 @@ function reconcileNextSequence(localDir: string, state: SpoolState): boolean {
 /** Reads state, repairs sequence metadata, and applies fail-closed migrations. */
 export function prepareQueue(localDir: string): SpoolState {
   const state = readState(localDir);
-  let changed = migrateLegacyEntries(localDir, state);
+  // Sequence reconciliation MUST precede legacy migration: if a prior migration
+  // crashed after writing held entries but before persisting state.json, a
+  // stale nextSequence would mint filenames that atomically replace those
+  // already-migrated entries (silent evidence loss). Deriving the floor from
+  // durable filenames first makes the migration crash-restartable.
+  let changed = reconcileNextSequence(localDir, state);
+  if (migrateLegacyEntries(localDir, state)) changed = true;
   if (state.circuit && entryNames(localDir, "pending").length > 0) {
     moveAll(localDir, "pending", "held");
     changed = true;
   }
-  if (reconcileNextSequence(localDir, state)) changed = true;
   if (changed) writeState(localDir, state);
   return state;
 }
