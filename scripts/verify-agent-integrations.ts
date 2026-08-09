@@ -9,6 +9,7 @@ const storage = readJson("storage/package.json");
 const claude = readJson("adapters/claude-code/package.json");
 const plugin = readJson("plugins/veritio/.claude-plugin/plugin.json");
 const hooks = readJson("plugins/veritio/hooks/hooks.json");
+const lockfile = readFileSync(resolve(root, "bun.lock"), "utf8");
 
 const releaseVersion = stringAt(core, "version");
 assertEqual(stringAt(storage, "version"), releaseVersion, "storage must share the core release version");
@@ -19,8 +20,15 @@ assertEqual(
   releaseVersion,
   "Claude Code must pin storage exactly",
 );
+const claudeWorkspace = lockfile.match(/"adapters\/claude-code": \{[\s\S]*?\n    \},/)?.[0] ?? "";
+if (
+  !claudeWorkspace.includes(`"@veritio/core": "${releaseVersion}"`) ||
+  !claudeWorkspace.includes(`"@veritio/storage": "${releaseVersion}"`)
+) {
+  throw new Error("bun.lock must record the exact Claude core/storage release pins");
+}
 
-const expectedHook = "bunx --package @veritio/claude-code@0.4.5 veritio-claude-code-hook";
+const expectedHook = `bunx --package @veritio/claude-code@${releaseVersion} veritio-claude-code-hook`;
 const commands = collectHookCommands(hooks);
 if (commands.length !== 7 || commands.some((command) => command !== expectedHook)) {
   throw new Error("every Claude plugin hook must use the exact reviewed, published package version");
@@ -36,7 +44,7 @@ console.log(
     outcome: "ok",
     releaseVersion,
     pluginVersion: stringAt(plugin, "version"),
-    pinnedPublishedClaudeVersion: "0.4.5",
+    pinnedClaudeVersion: releaseVersion,
     codexMaximumRemoteAttemptMs: MAX_INGEST_TIMEOUT_MS,
   }),
 );

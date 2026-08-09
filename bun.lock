@@ -33,8 +33,8 @@
         "veritio-claude-code-mcp": "dist/mcp.js",
       },
       "dependencies": {
-        "@veritio/core": "0.4.3",
-        "@veritio/storage": "0.4.3",
+        "@veritio/core": "0.4.6",
+        "@veritio/storage": "0.4.6",
       },
     },
     "adapters/codex": {

@@ -227,6 +227,7 @@ export async function flushSpool(
         await postToIngest(
           { ...ingest, timeoutMs: Math.max(1, Math.min(ingest.timeoutMs ?? FLUSH_TIMEOUT_MS, remainingMs)) },
           location.entry.payload,
+          "replay-v1",
         );
         removeDispatchedEntry(localDir, location.name);
         result.dispatchedBatches += 1;

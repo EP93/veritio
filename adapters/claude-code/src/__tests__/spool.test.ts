@@ -49,12 +49,14 @@ function tempDir(): string {
 }
 
 const received: string[] = [];
+const deliveries: string[] = [];
 let requests = 0;
 let mode: "ok" | "retry" | "pause" | "reject" | "slow" = "ok";
 const server = Bun.serve({
   port: 0,
   async fetch(request) {
     requests += 1;
+    deliveries.push(request.headers.get("x-veritio-delivery") ?? "missing");
     if (mode === "retry") {
       return Response.json({ error: "temporary failure", deliveryDisposition: "retry" }, { status: 503 });
     }
@@ -103,6 +105,7 @@ afterEach(() => {
   mode = "ok";
   received.length = 0;
   requests = 0;
+  deliveries.length = 0;
 });
 
 afterAll(() => {
@@ -180,6 +183,15 @@ describe("shipWithSpool", () => {
 });
 
 describe("explicit replay permits", () => {
+  test("marks explicit spool drains as replay traffic for server-side replay budgets", async () => {
+    const dir = tempDir();
+    saveToSpool(dir, payloadOf("evt_replay"));
+
+    await flushSpool(INGEST, dir, permit({ maxBatches: 1 }));
+
+    expect(deliveries).toEqual(["replay-v1"]);
+  });
+
   test("flush refuses a missing, non-finite, or unbounded permit before network I/O", async () => {
     const dir = tempDir();
     saveToSpool(dir, payloadOf("evt_kept"));

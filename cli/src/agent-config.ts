@@ -36,7 +36,11 @@ export function buildCaptureEnv(creds: VeritioCredentials): string {
  * Veritio capture in the background so it can never block or fail the turn.
  * `existingNotify` is the command array Codex had configured before login.
  */
-export function buildCodexWrapper(notifyBinPath: string, existingNotify: readonly string[] | null): string {
+export function buildCodexWrapper(
+  notifyBinPath: string,
+  existingNotify: readonly string[] | null,
+  captureEnvPath: string = CODEX_ENV_PATH,
+): string {
   const forward =
     existingNotify && existingNotify.length > 0
       ? `${existingNotify.map((part) => `'${part.replace(/'/g, "'\\''")}'`).join(" ")} "$@" || true\n`
@@ -45,7 +49,7 @@ export function buildCodexWrapper(notifyBinPath: string, existingNotify: readonl
     "#!/bin/bash",
     "# Managed by `veritio login codex`. Forwards to your existing notifier (if any),",
     "# then runs Veritio capture in the background — capture never blocks the turn.",
-    `set -a; . '${CODEX_ENV_PATH}'; set +a`,
+    `set -a; . '${captureEnvPath}'; set +a`,
     forward.trimEnd(),
     `nohup '${notifyBinPath}' "$@" >/dev/null 2>&1 &`,
     "",

@@ -39,10 +39,12 @@ const hangingServer = Bun.serve({
 });
 
 let lastAuth: string | null = null;
+let lastDelivery: string | null = null;
 const okServer = Bun.serve({
   port: 0,
   fetch(request) {
     lastAuth = request.headers.get("authorization");
+    lastDelivery = request.headers.get("x-veritio-delivery");
     return Promise.resolve(Response.json({ appended: { events: 1, edges: 0 } }));
   },
 });
@@ -116,6 +118,7 @@ describe("postToIngest — bounded abort (the un-freeze invariant)", () => {
   test("success path still posts with the bearer key", async () => {
     await postToIngest({ url: okServer.url.href, key: "vrt_ok", timeoutMs: 2_000 }, { events: [EVENT], edges: [] });
     expect(lastAuth).toBe("Bearer vrt_ok");
+    expect(lastDelivery).toBe("live-v1");
   });
 
   test("non-2xx still surfaces a typed-ish error for the fail-open hook boundary to log", () => {

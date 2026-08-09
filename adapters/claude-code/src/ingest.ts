@@ -93,6 +93,7 @@ export function isRetryableIngestFailure(error: unknown): boolean {
 export async function postToIngest(
   ingest: { url: string; key: string; timeoutMs?: number },
   payload: { events: AuditEvent[]; edges: EvidenceEdge[] },
+  delivery: "live-v1" | "replay-v1" = "live-v1",
 ): Promise<void> {
   if (payload.events.length === 0 && payload.edges.length === 0) {
     return;
@@ -103,7 +104,11 @@ export async function postToIngest(
   }
   const response = await fetch(ingest.url, {
     method: "POST",
-    headers: { authorization: `Bearer ${ingest.key}`, "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${ingest.key}`,
+      "content-type": "application/json",
+      "x-veritio-delivery": delivery,
+    },
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(timeoutMs),
   });

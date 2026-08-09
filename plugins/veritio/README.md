@@ -5,8 +5,9 @@ when — recorded to Veritio Cloud, plus a hosted MCP server so you (or Claude)
 can query that evidence back.
 
 - **Passive capture** — session start/end, prompts, tool calls, and file changes
-  are recorded via Claude Code hooks. **Hash-only**: raw prompts, tool inputs,
-  and file contents are never stored — only stable ids and content hashes.
+  are recorded via Claude Code hooks. Raw prompts, tool argument payloads, and
+  file contents are not stored; stable ids, content hashes, and temporary local
+  file-path keys used to pair pre/post edit hashes are retained.
 - **Hosted MCP** — `list_sessions` / `get_session` / `export_session` against
   your own evidence, over `https://console.getveritio.com/api/mcp`.
 
@@ -43,11 +44,12 @@ Code's built-in OAuth (approve it once in `/mcp`).
 | `Stop` | `git status` turn-scan for Bash-driven file changes |
 | `SessionEnd` | finalizes session state |
 
-Capture runs the exact published `@veritio/claude-code@0.4.5` via `bunx`; it
+Capture is pinned to the reviewed `@veritio/claude-code@0.4.6` via `bunx`; it
 does not resolve npm latest for every hook. The credentials come from the env
 written by a repository-checkout `veritio login` (the CLI is not published;
-see `@veritio/claude-code` for the full env contract). Upgrade the plugin pin
-only after the candidate package is published and verified from the registry.
+only after this exact package is published and verified from the registry; an
+unavailable exact version fails closed instead of falling back to an older or
+latest runtime.
 
 Hosted delivery is local-first and bounded: one hook never drains old work, the
 durable remote queue has hard batch/byte ceilings, and recovery requires a

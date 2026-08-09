@@ -12,9 +12,11 @@ not depend on the agent choosing to report. A companion MCP server lets a human 
 another agent list sessions, inspect a session's provenance graph, and export a
 verifiable bundle.
 
-> **Privacy:** raw prompts, tool inputs (Bash commands, MCP arguments — which can
-> carry secrets), and file contents/diffs are **never** persisted. Only stable ids
-> and content hashes travel. Redaction runs in the hook before anything reaches a sink.
+> **Privacy:** raw prompts, tool argument payloads (Bash commands, MCP arguments —
+> which can carry secrets), and file contents/diffs are **never** persisted.
+> Stable ids and content hashes travel. Raw file paths can be retained temporarily
+> in local per-session state to pair a pre-image with its post-image; they are not
+> sent as evidence metadata. Redaction runs before anything reaches a sink.
 
 ## What is captured
 
@@ -50,9 +52,9 @@ bundler/Bun-resolved). Add to your project's `.claude/settings.json`
 The hook always exits `0` — a logging hook never blocks the agent.
 
 Install an exact reviewed version in repositories and hosted runners; do not
-use an unversioned `bunx` command. The bundled plugin currently pins the
-published `@veritio/claude-code@0.4.5`. The 0.4.6 source in this branch is a
-release candidate until the registry readback succeeds.
+use an unversioned `bunx` command. The bundled plugin pins
+`@veritio/claude-code@0.4.6`. Treat it as unavailable until exact registry
+readback succeeds; the plugin must fail closed rather than fall back to 0.4.5.
 
 The `veritio` CLI device-login helper is not published yet. From a repository
 checkout, build it with `bun run --cwd cli build` and invoke
