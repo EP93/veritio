@@ -5,6 +5,21 @@ import { join } from "node:path";
 import { buildCaptureEnv, buildCodexWrapper } from "../agent-config.js";
 import { extractNotify, type LoginDeps, parseLoginArgs, runLogin, upsertNotify } from "../login.js";
 
+/**
+ * Reads the wrapper's call log as lines, treating a not-yet-created file as
+ * empty. The log is written by a detached background process, so polling must
+ * tolerate the window before the first write instead of throwing ENOENT.
+ */
+function readLogLines(logPath: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(logPath, "utf8").trim();
+  } catch {
+    return [];
+  }
+  return text === "" ? [] : text.split("\n");
+}
+
 describe("parseLoginArgs", () => {
   test("defaults to both agents against prod console", () => {
     const opts = parseLoginArgs(["login"]);
@@ -59,14 +74,22 @@ describe("codex config surgery", () => {
         { stdout: "pipe", stderr: "pipe" },
       );
       expect(await process.exited).toBe(0);
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        if (readFileSync(logPath, "utf8").trim().split("\n").length === 2) break;
+      // Capture is deliberately detached (`nohup … &`) so it never blocks a
+      // Codex turn, which means it is reparented and outlives the wrapper's
+      // shell: the wrapper exiting proves nothing about capture having run.
+      // Poll the observable side effect against a generous ceiling instead of
+      // a short fixed budget — a tight window made this flaky on a loaded
+      // machine while proving nothing extra on an idle one.
+      const deadline = Date.now() + 5_000;
+      let lines = readLogLines(logPath);
+      while (lines.length < 2 && Date.now() < deadline) {
         await Bun.sleep(10);
+        lines = readLogLines(logPath);
       }
-      expect(readFileSync(logPath, "utf8").trim().split("\n").sort()).toEqual([
-        "capture",
-        "original",
-      ]);
+      // Let a duplicate invocation land before asserting, so "exactly once"
+      // is actually proven rather than raced past the moment two lines exist.
+      await Bun.sleep(100);
+      expect(readLogLines(logPath).sort()).toEqual(["capture", "original"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

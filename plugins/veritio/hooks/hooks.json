@@ -3,14 +3,14 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.6 veritio-claude-code-hook" }
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.7 veritio-claude-code-hook" }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.6 veritio-claude-code-hook" }
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.7 veritio-claude-code-hook" }
         ]
       }
     ],
@@ -18,35 +18,35 @@
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.6 veritio-claude-code-hook" }
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.7 veritio-claude-code-hook" }
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.6 veritio-claude-code-hook" }
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.7 veritio-claude-code-hook" }
         ]
       }
     ],
     "PostToolUseFailure": [
       {
         "hooks": [
-          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.6 veritio-claude-code-hook" }
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.7 veritio-claude-code-hook" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.6 veritio-claude-code-hook" }
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.7 veritio-claude-code-hook" }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.6 veritio-claude-code-hook" }
+          { "type": "command", "command": "bunx --package @veritio/claude-code@0.4.7 veritio-claude-code-hook" }
         ]
       }
     ]

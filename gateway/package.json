@@ -1,6 +1,6 @@
 {
   "name": "@veritio/gateway",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Self-hosted AI governance gateway: transparent Anthropic/OpenAI passthrough proxy with virtual keys, enforced allowlist policy, provider-reported metering, and hash-chained Veritio evidence.",
   "license": "Apache-2.0",
   "repository": {

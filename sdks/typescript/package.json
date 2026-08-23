@@ -1,6 +1,6 @@
 {
   "name": "@veritio/core",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Protocol-first TypeScript SDK for application audit trails, consent history, retention, and data subject workflow evidence.",
   "homepage": "https://getveritio.com",
   "license": "Apache-2.0",

@@ -4,7 +4,7 @@ All notable changes to Veritio will be documented in this file.
 
 Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while the protocol, SDKs, adapters, and storage contracts settle. Release notes should be explicit about migration steps and should avoid legal-compliance guarantees.
 
-## [0.4.6] - 2026-08-03
+## [0.4.7] - 2026-08-23
 
 ### Added
 
@@ -14,17 +14,52 @@ Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while th
 - CI now verifies the Claude plugin package pin, the core/storage/Claude release
   train, disabled-by-default hosted plugin state, and the Codex remote-attempt
   ceiling before the main suite.
+- Capture delivery modes are tagged on the wire: the Claude Code adapter sends
+  `x-veritio-delivery` (`live-v1` for hooks, `replay-v1` for spool drains) so
+  server-side replay budgets can meter drains separately from live capture.
+- `spec/conformance/provenance-ids.json` pins the tool-event id and the
+  absent-`resultVersion` sentinel, both exercised through the public recorder
+  surface in the TypeScript conformance test.
 
 ### Changed
 
-- Prepared `@veritio/core`, `@veritio/storage`, and `@veritio/claude-code`
-  0.4.6 together with exact internal pins. Publishing still requires the guarded
-  release script and a short-lived npm token after merge.
-- The Claude plugin pins the currently published, reviewed
-  `@veritio/claude-code@0.4.5` instead of resolving npm latest on every hook.
-  Move the pin to 0.4.6 only after the registry confirms that release.
+- Released `@veritio/core`, `@veritio/storage`, and `@veritio/claude-code`
+  0.4.7 together with exact internal pins. Publishing still requires the guarded
+  release script and a short-lived npm token.
+- The Claude plugin pins an exact reviewed `@veritio/claude-code` version
+  instead of resolving npm latest on every hook, and
+  `verify:agent-integrations` fails the build unless all seven hooks, the
+  Claude Code dependency pins, and `bun.lock` agree with the release version.
+  An unavailable exact version fails closed rather than falling back.
+- Published framework adapters (`better-auth`, `next`, `tanstack-start`,
+  `sveltekit`, `react`, `vue`, `svelte`) move to 0.0.4. They declare
+  `@veritio/core` as a peer at `>=0.0.0`, so this is a republish, not a
+  compatibility change.
 - The experimental, still-unpublished `@veritio/codex` workspace package moves
-  to 0.0.2 and rejects both env and direct-call ingest timeouts above 30 seconds.
+  to 0.0.3 and rejects both env and direct-call ingest timeouts above 30
+  seconds.
+- `rm --recursive`, `rimraf` (including `npx`/`bunx` invocations), and
+  `find … -delete` now classify as destructive/irreversible. Matching is scoped
+  to one shell word group so pipeline segments cannot smear flags onto an
+  unrelated leading command. This mapping is hash-affecting capture contract;
+  the adapter `DESIGN.md` table changed in the same commit.
+
+### Fixed
+
+- The Claude Code spool reconciles its sequence from durable filenames before
+  legacy migration, so an interrupted upgrade can never overwrite an
+  already-migrated entry.
+- The storage HTTP ingest client honors the portable three-way
+  `deliveryDisposition` first; pause no longer requires the hosted hold code,
+  and legacy pause codes remain a fallback only.
+- Rolling request and byte ceilings are accounted across dispatch passes via a
+  per-dispatcher rolling window ledger, and each in-flight ingest request is
+  clamped to the permit time remaining so a dispatch pass cannot outlive its
+  permit or lease.
+- The gateway ship-out outbox enforces a hard queued-bytes ceiling; a full
+  queue drops only the remote copy and surfaces a typed hold.
+- `veritio login` bounds its HTTP requests and skips rewriting an
+  already-managed Codex wrapper.
 
 ### Safety
 

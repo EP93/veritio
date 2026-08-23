@@ -1,6 +1,6 @@
 {
   "name": "@veritio/claude-code",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Capture Claude Code agent activity as Veritio evidence via hooks, with a local file sink or ingest POST.",
   "homepage": "https://getveritio.com",
   "license": "Apache-2.0",
@@ -46,7 +46,7 @@
     "test": "bun run --cwd ../../storage build && bun test src"
   },
   "dependencies": {
-    "@veritio/core": "0.4.6",
-    "@veritio/storage": "0.4.6"
+    "@veritio/core": "0.4.7",
+    "@veritio/storage": "0.4.7"
   }
 }
