@@ -1,6 +1,6 @@
 {
   "name": "@veritio/server",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Local and self-hosted Veritio Node server for Workbench, MCP, graph query, verification, and export preview.",
   "private": true,
   "license": "Apache-2.0",

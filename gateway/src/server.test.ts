@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { verifyAuditRecords } from "@veritio/core";
 import { createFileEvidenceStore } from "@veritio/storage";
 import { hashPresentedKey } from "./keys";
-import { startGateway, type StartedGateway } from "./server";
+import { type StartedGateway, startGateway } from "./server";
 
 const PRESENTED_KEY = "vk_e2e_0123456789abcdef";
 const stops: (() => void)[] = [];
@@ -46,6 +46,13 @@ interface E2e {
   configRaw: Record<string, unknown>;
 }
 
+interface CloudE2e {
+  gateway: StartedGateway;
+  evidenceDir: string;
+  base: string;
+  batches: Array<{ auth: string | null; actions: string[] }>;
+}
+
 async function startE2e(): Promise<E2e> {
   const dir = mkdtempSync(join(tmpdir(), "veritio-gateway-e2e-"));
   const evidenceDir = join(dir, "evidence");
@@ -75,6 +82,58 @@ async function startE2e(): Promise<E2e> {
   return { gateway, configPath, evidenceDir, configRaw };
 }
 
+/** Starts a gateway with a mock ingest endpoint and optional one-shot startup canary. */
+async function startCloudE2e(startupMode?: "canary"): Promise<CloudE2e> {
+  const batches: Array<{ auth: string | null; actions: string[] }> = [];
+  const ingestServer = Bun.serve({
+    port: 0,
+    async fetch(req: Request): Promise<Response> {
+      const body = (await req.json()) as { events: Array<{ action: string }> };
+      batches.push({ auth: req.headers.get("authorization"), actions: body.events.map((event) => event.action) });
+      return Response.json({ appended: { events: body.events.length, edges: 0 }, tips: { event: "h", edge: null } });
+    },
+  });
+  stops.push(() => ingestServer.stop(true));
+  const dir = mkdtempSync(join(tmpdir(), "veritio-gateway-cloud-e2e-"));
+  const evidenceDir = join(dir, "evidence");
+  const provider = startMockProvider();
+  stops.push(provider.stop);
+  const configPath = join(dir, "veritio-gateway.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      tenantId: "tenant_cloud_e2e",
+      gatewayId: "gw_cloud_e2e",
+      evidenceDir,
+      ingest: {
+        url: `http://127.0.0.1:${ingestServer.port}`,
+        key: "vrt_e2e_scoped",
+        ...(startupMode === undefined ? {} : { startupMode }),
+      },
+      providers: { anthropic: { baseUrl: `http://127.0.0.1:${provider.port}`, apiKey: "sk-ant-e2e-real" } },
+      policies: { default: { providers: ["anthropic"], models: ["claude-sonnet-*"], endpoints: ["messages"] } },
+      keys: [{ keyId: "vk_e2e", keyHash: hashPresentedKey(PRESENTED_KEY), policy: "default" }],
+    }),
+  );
+  const gateway = await startGateway({
+    configPath,
+    port: 0,
+    retryIntervalMs: 30,
+    installSignalHandlers: false,
+  });
+  stops.push(gateway.stop);
+  return { gateway, evidenceDir, base: `http://127.0.0.1:${gateway.port}`, batches };
+}
+
+/** Sends one allowed request through a cloud-configured gateway. */
+async function sendCloudRequest(base: string): Promise<Response> {
+  return fetch(`${base}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": PRESENTED_KEY },
+    body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 16 }),
+  });
+}
+
 describe("gateway e2e over real HTTP", () => {
   test("non-streaming and streaming round trips leave a verifiable evidence chain", async () => {
     const e2e = await startE2e();
@@ -82,6 +141,11 @@ describe("gateway e2e over real HTTP", () => {
 
     const health = await fetch(`${base}/healthz`);
     expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({
+      status: "ok",
+      pendingEvidence: 0,
+      shipOut: { state: "disabled", pending: 0, paused: 0, quarantined: 0, canaryAttempted: false },
+    });
 
     const plain = await fetch(`${base}/v1/messages`, {
       method: "POST",
@@ -139,64 +203,40 @@ describe("gateway e2e over real HTTP", () => {
     expect((await after.json()).error.type).toBe("revoked_key");
   });
 
-  test("with ingest configured, evidence ships to the cloud endpoint asynchronously", async () => {
-    // Mock Veritio Cloud ingest: records every batch, validates the scoped key.
-    const batches: { auth: string | null; actions: string[] }[] = [];
-    const ingestServer = Bun.serve({
-      port: 0,
-      async fetch(req: Request): Promise<Response> {
-        const body = (await req.json()) as { events: { action: string }[] };
-        batches.push({ auth: req.headers.get("authorization"), actions: body.events.map((e) => e.action) });
-        return new Response(
-          JSON.stringify({ appended: { events: body.events.length, edges: 0 }, tips: { event: "h", edge: null } }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      },
-    });
-    stops.push(() => ingestServer.stop(true));
-
-    const dir = mkdtempSync(join(tmpdir(), "veritio-gateway-cloud-e2e-"));
-    const evidenceDir = join(dir, "evidence");
-    const provider = startMockProvider();
-    stops.push(provider.stop);
-    const configPath = join(dir, "veritio-gateway.json");
-    writeFileSync(
-      configPath,
-      JSON.stringify({
-        tenantId: "tenant_cloud_e2e",
-        gatewayId: "gw_cloud_e2e",
-        evidenceDir,
-        ingest: { url: `http://127.0.0.1:${ingestServer.port}`, key: "vrt_e2e_scoped" },
-        providers: { anthropic: { baseUrl: `http://127.0.0.1:${provider.port}`, apiKey: "sk-ant-e2e-real" } },
-        policies: { default: { providers: ["anthropic"], models: ["claude-sonnet-*"], endpoints: ["messages"] } },
-        keys: [{ keyId: "vk_e2e", keyHash: hashPresentedKey(PRESENTED_KEY), policy: "default" }],
-      }),
-    );
-    const gateway = await startGateway({
-      configPath,
-      port: 0,
-      retryIntervalMs: 150,
-      installSignalHandlers: false,
-    });
-    stops.push(gateway.stop);
-
-    const res = await fetch(`http://127.0.0.1:${gateway.port}/v1/messages`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": PRESENTED_KEY },
-      body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 16 }),
-    });
+  test("ingest starts held by default and health reports only sanitized queue state", async () => {
+    const e2e = await startCloudE2e();
+    const res = await sendCloudRequest(e2e.base);
     expect(res.status).toBe(200);
+    await Bun.sleep(150);
 
-    // Wait for the retry tick to drain the outbox to the mock cloud.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(e2e.batches).toHaveLength(0);
+    const healthText = await (await fetch(`${e2e.base}/healthz`)).text();
+    expect(JSON.parse(healthText)).toMatchObject({
+      shipOut: { state: "held", pending: 1, paused: 0, quarantined: 0, canaryAttempted: false },
+    });
+    expect(healthText).not.toContain("vrt_e2e_scoped");
+    expect(healthText).not.toContain("sk-ant-e2e-real");
+  });
 
-    expect(batches.length).toBeGreaterThanOrEqual(1);
-    expect(batches[0]!.auth).toBe("Bearer vrt_e2e_scoped");
-    expect(batches.flatMap((b) => b.actions)).toContain("ai.request.completed");
+  test("an explicit startup canary ships at most one queued entry", async () => {
+    const e2e = await startCloudE2e("canary");
+    expect((await sendCloudRequest(e2e.base)).status).toBe(200);
+    await Bun.sleep(150);
+
+    expect(e2e.batches).toHaveLength(1);
+    expect(e2e.batches[0]!.auth).toBe("Bearer vrt_e2e_scoped");
+    expect(e2e.batches[0]!.actions).toContain("ai.request.completed");
+
+    expect((await sendCloudRequest(e2e.base)).status).toBe(200);
+    await Bun.sleep(150);
+    expect(e2e.batches).toHaveLength(1);
+    expect(await (await fetch(`${e2e.base}/healthz`)).json()).toMatchObject({
+      shipOut: { state: "canary_complete", pending: 1, canaryAttempted: true },
+    });
 
     // Local store stayed authoritative regardless of ship-out.
-    const records = await createFileEvidenceStore(evidenceDir).listEvents();
-    expect(records).toHaveLength(1);
+    const records = await createFileEvidenceStore(e2e.evidenceDir).listEvents();
+    expect(records).toHaveLength(2);
     expect(verifyAuditRecords(records)).toEqual({ ok: true });
     // The scoped ingest key never leaks into local evidence.
     expect(JSON.stringify(records)).not.toContain("vrt_e2e_scoped");

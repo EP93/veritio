@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "veritio",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Tamper-evident audit trail for your Claude Code sessions: passive hash-only capture into Veritio Cloud, plus a hosted MCP server to query your own evidence.",
   "author": { "name": "Veritio", "email": "team@getveritio.com" },
   "homepage": "https://getveritio.com",

@@ -13,15 +13,18 @@
  * endpoint deduplicates by record id (server re-redacts and re-chains).
  */
 import type { AuditEventInput, AuditRecord } from "@veritio/core";
-import type { OutboxAdapter } from "@veritio/storage";
+import { type OutboxAdapter, OutboxQueueFullError } from "@veritio/storage";
 import type { GatewayEvidenceSink } from "./evidence";
+
+/** Why one remote-delivery copy was dropped; the local record is always kept. */
+export type ShipOutEnqueueFailure = "error" | "queue_full";
 
 /** Options for the ship-out wrapper; the host injects the configured outbox. */
 export interface ShipOutSinkOptions {
   outbox: OutboxAdapter;
   tenantId: string;
   /** Sanitized warning hook; defaults to a value-free console.error line. */
-  onEnqueueError?: (eventId: string) => void;
+  onEnqueueError?: (eventId: string, reason: ShipOutEnqueueFailure) => void;
 }
 
 /**
@@ -32,8 +35,12 @@ export interface ShipOutSinkOptions {
 export function createShipOutSink(local: GatewayEvidenceSink, options: ShipOutSinkOptions): GatewayEvidenceSink {
   const warn =
     options.onEnqueueError ??
-    ((eventId: string) => {
-      console.error(`veritio-gateway: cloud ship-out enqueue failed for event ${eventId}; local record kept`);
+    ((eventId: string, reason: ShipOutEnqueueFailure) => {
+      console.error(
+        reason === "queue_full"
+          ? `veritio-gateway: cloud ship-out outbox is full; holding new remote copies (event ${eventId} kept locally)`
+          : `veritio-gateway: cloud ship-out enqueue failed for event ${eventId}; local record kept`,
+      );
     });
 
   return {
@@ -52,8 +59,8 @@ export function createShipOutSink(local: GatewayEvidenceSink, options: ShipOutSi
             },
           }),
         );
-      } catch {
-        warn(record.event.id);
+      } catch (error) {
+        warn(record.event.id, error instanceof OutboxQueueFullError ? "queue_full" : "error");
       }
       return record;
     },

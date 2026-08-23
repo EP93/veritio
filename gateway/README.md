@@ -101,7 +101,10 @@ console.log(verifyAuditRecords(records)); // { ok: true } or the first broken li
 
 ## Operations
 
-- `GET /healthz` — `{ status, pendingEvidence }`, 200/503.
+- `GET /healthz` — `{ status, pendingEvidence, shipOut }`, 200/503. `shipOut`
+  contains only lifecycle state and counts; it never includes payloads, errors,
+  credentials, or circuit ids. Cloud delivery state does not make the gateway
+  unhealthy because the local evidence store remains authoritative.
 - `SIGHUP` — reload the config file (key rotation/revocation without restart; a broken config
   keeps the previous one active).
 - OpenAI streaming: the gateway injects `stream_options.include_usage` when absent so usage is
@@ -123,9 +126,34 @@ endpoint (hosted Veritio Cloud or your own):
 
 `key` is a scoped ingest key created in the console. Semantics: the local evidence store
 stays authoritative; delivery is asynchronous through a durable outbox under
-`<evidenceDir>/outbox` (retryable failures stay queued, the server re-redacts and
-deduplicates by record id); a cloud outage never affects proxied traffic. The gateway is
-fully usable without this block — no Veritio account required.
+`<evidenceDir>/outbox`; a cloud outage never affects proxied traffic. Ship-out starts in
+`held` mode by default and ordinary maintenance ticks perform zero remote requests.
+Retryable failures remain pending, permanent rejections are quarantined by the outbox,
+and an economic-safety pause is persisted across gateway restarts.
+
+To allow one startup recovery probe, opt in to a finite canary:
+
+```jsonc
+{
+  "ingest": {
+    "url": "https://console.getveritio.com",
+    "key": "vrt_…",
+    "startupMode": "canary",
+    "canary": {
+      "maxBytes": 250000,
+      "maxElapsedMs": 5000,
+      "leaseMs": 30000
+    }
+  }
+}
+```
+
+The canary always uses exactly one-entry authorization and is consumed at most once for
+the running gateway process. Later maintenance ticks never promote it into a backlog
+drain. Config may lower the byte/time ceilings but cannot raise the compiled-in 1 MiB /
+15 second hard limits; the request timeout uses the same elapsed-time ceiling. The lease
+must be longer than the elapsed-time budget and cannot exceed 60 seconds. The
+gateway is fully usable without an ingest block — no Veritio account required.
 
 ## Embedding in your own host
 

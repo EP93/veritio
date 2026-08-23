@@ -32,7 +32,7 @@
     },
     "../../adapters/better-auth": {
       "name": "@veritio/better-auth",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -46,11 +46,11 @@
     },
     "../../sdks/typescript": {
       "name": "@veritio/core",
-      "version": "0.4.0",
+      "version": "0.4.6",
     },
     "../../storage": {
       "name": "@veritio/storage",
-      "version": "0.4.0",
+      "version": "0.4.6",
       "devDependencies": {
         "@veritio/core": "workspace:*",
         "mongodb": "^7.3.0",

@@ -1,6 +1,6 @@
 {
   "name": "@veritio/sveltekit",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "SvelteKit adapter for recording Veritio audit trail evidence from server-side actions and endpoints.",
   "homepage": "https://getveritio.com",
   "license": "Apache-2.0",

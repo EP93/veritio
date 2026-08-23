@@ -110,7 +110,7 @@ reads/builds never inflate episode risk):
 
 | Precedence | Pattern class (case-insensitive) | `operationType` | `reversibility` |
 |---|---|---|---|
-| 1 | `rm` with a short-flag recursive group (`-r`/`-rf`/`-fr`/`-R`…), `git reset --hard`, `git clean -f*`, `git push --force`/`-f`, `drop table|database|schema`, `truncate table`, `terraform destroy`, `kubectl delete`, `mkfs`, `dd if=` | `destructive` | `irreversible` |
+| 1 | `rm` with a short-flag recursive group (`-r`/`-rf`/`-fr`/`-R`…), `rm … --recursive` (long flag, same shell word group — no `|`/`;`/`&` between `rm` and the flag), `rimraf` (incl. `npx`/`bunx rimraf`), `find … -delete` (same word group), `git reset --hard`, `git clean -f*`, `git push --force`/`-f`, `drop table|database|schema`, `truncate table`, `terraform destroy`, `kubectl delete`, `mkfs`, `dd if=` | `destructive` | `irreversible` |
 | 2 | `rm`, `rmdir`, `unlink`, `git branch -D` | `delete` | `recoverable` |
 | 3 | `chmod`, `chown`, `sudo` | `permission` | `reversible` |
 | 4 | `git config`, `npm config`, `wrangler secret`, `export VAR=` | `config` | `reversible` |
@@ -125,10 +125,10 @@ tool call that produced it.
 environment label containing `prod` → `production`, `stag` → `staging`,
 `sandbox` → `sandbox`, anything else → `development`.
 
-Known conservative gaps (tracked in `docs/review-backlog.md`, deliberate
-false-negatives until fixed here AND in this table): long-form
-`rm --recursive` is not matched by the destructive short-flag regex, and
-`npx rimraf` / `find … -delete` attach no signal.
+The long-form gaps flagged in the 2026-07-18 review (`rm --recursive`,
+`npx rimraf`, `find … -delete`) are now matched by precedence 1; the
+patterns stay scoped to one shell word group so a pipeline segment after
+`|`/`;`/`&` cannot smear a flag onto an unrelated leading command.
 
 ## Redaction (`redact.ts`) — non-negotiable (`.claude/rules/03-privacy-security.md`)
 

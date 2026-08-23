@@ -4,8 +4,8 @@ import {
   buildCodexWrapper,
   CODEX_ENV_PATH,
   CODEX_WRAPPER_PATH,
-  codexNotifyLine,
   CREDENTIALS_PATH,
+  codexNotifyLine,
   ingestUrlFor,
   type VeritioCredentials,
 } from "./agent-config.js";
@@ -28,6 +28,7 @@ export interface LoginOptions {
 }
 
 const DEFAULT_CONSOLE_URL = "https://console.getveritio.com";
+const LOGIN_REQUEST_TIMEOUT_MS = 15_000;
 const LOGIN_USAGE =
   "Usage: veritio login [codex|claude|both] [--console-url <url>] [--client-name <name>] [--no-browser]";
 
@@ -81,6 +82,8 @@ type DevicePoll =
 
 /** Injectable side effects so the flow is fully testable without real I/O. */
 export interface LoginDeps {
+  /** Absolute reviewed adapter entrypoint; never relies on an ambient global bin. */
+  codexNotifyBin: string;
   fetch: typeof fetch;
   write(message: string): void;
   writeFile(path: string, contents: string, mode: number): Promise<void>;
@@ -147,10 +150,13 @@ export async function runLogin(options: LoginOptions, deps: LoginDeps): Promise<
  */
 async function configureCodex(creds: VeritioCredentials, deps: LoginDeps): Promise<void> {
   await deps.writeFile(CODEX_ENV_PATH, buildCaptureEnv(creds), 0o600);
-  const notifyBin = "veritio-codex-notify";
+  const notifyBin = deps.codexNotifyBin;
   const existing = await deps.readCodexConfig();
   const existingNotify = existing ? extractNotify(existing) : null;
-  await deps.writeFile(CODEX_WRAPPER_PATH, buildCodexWrapper(notifyBin, existingNotify), 0o755);
+  const alreadyManaged = existingNotify?.length === 1 && existingNotify[0] === CODEX_WRAPPER_PATH;
+  if (!alreadyManaged) {
+    await deps.writeFile(CODEX_WRAPPER_PATH, buildCodexWrapper(notifyBin, existingNotify), 0o755);
+  }
   const nextConfig = upsertNotify(existing ?? "", codexNotifyLine(CODEX_WRAPPER_PATH));
   await deps.writeCodexConfig(nextConfig);
   deps.write(`Codex: notify hook installed (wrapper at ${CODEX_WRAPPER_PATH}).\n`);
@@ -180,6 +186,7 @@ async function postJson(fetchImpl: typeof fetch, url: string, body: unknown): Pr
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(LOGIN_REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new Error(`request to ${url} failed with status ${response.status}`);

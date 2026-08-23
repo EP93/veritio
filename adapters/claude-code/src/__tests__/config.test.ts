@@ -33,6 +33,34 @@ describe("resolveConfig — VERITIO_ACTIVITY_EPISODE_ID", () => {
   });
 });
 
+describe("resolveConfig — bounded delivery spool", () => {
+  test("uses conservative hard bounds unless the host explicitly lowers them", () => {
+    expect(resolveConfig({} as NodeJS.ProcessEnv).spoolLimits).toEqual({
+      hardBatches: 250,
+      hardBytes: 50_000_000,
+    });
+    expect(
+      resolveConfig({
+        VERITIO_SPOOL_HARD_BATCHES: "25",
+        VERITIO_SPOOL_HARD_BYTES: "1000000",
+      } as NodeJS.ProcessEnv).spoolLimits,
+    ).toEqual({ hardBatches: 25, hardBytes: 1_000_000 });
+  });
+
+  test("rejects non-finite, non-integer, and expanded hard bounds", () => {
+    const invalidCases: Array<[string, string]> = [
+      ["VERITIO_SPOOL_HARD_BATCHES", "0"],
+      ["VERITIO_SPOOL_HARD_BATCHES", "251"],
+      ["VERITIO_SPOOL_HARD_BATCHES", "Infinity"],
+      ["VERITIO_SPOOL_HARD_BYTES", "1.5"],
+      ["VERITIO_SPOOL_HARD_BYTES", "50000001"],
+    ];
+    for (const [name, value] of invalidCases) {
+      expect(() => resolveConfig({ [name]: value } as NodeJS.ProcessEnv)).toThrow("hard safety ceiling");
+    }
+  });
+});
+
 describe("SessionStart activity-episode resolution (override wins; default otherwise)", () => {
   // Mirrors the hook's first-SessionStart precedence (state is empty):
   //   state.activityEpisodeId ?? config.activityEpisodeId ?? episodeIdOf(sessionId)

@@ -1608,6 +1608,9 @@ async function handleWorkbenchRequest(
     if (request.method === "GET" && url.pathname === "/") {
       return htmlResponse(renderWorkbenchHtml());
     }
+    if (request.method === "GET" && url.pathname === "/favicon.ico") {
+      return new Response(null, { status: 204 });
+    }
     if (url.pathname === "/v1/events") {
       if (request.method === "GET") {
         return jsonResponse({

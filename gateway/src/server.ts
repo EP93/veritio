@@ -16,14 +16,17 @@ import {
   createFileOutboxAdapter,
   createHttpIngestTarget,
   createHttpOutboxDispatcher,
+  DEFAULT_DELIVERY_SAFETY_POLICY,
+  type OutboxAdapter,
   type OutboxDispatcher,
 } from "@veritio/storage";
-import { parseGatewayConfig, type GatewayConfig } from "./config";
+import { type GatewayConfig, parseGatewayConfig } from "./config";
 import { buildGapMarkerEvent, createGatewayEvidence, type GatewayEvidence, type GatewayEvidenceSink } from "./evidence";
 import { createHealthState, type HealthState } from "./health";
-import { parsePricingCatalog, type PricingCatalog } from "./pricing";
+import { type PricingCatalog, parsePricingCatalog } from "./pricing";
 import { createGatewayHandler } from "./proxy";
 import { createShipOutSink } from "./shipout";
+import { createShipOutRuntime, type ShipOutDeliveryGeneration, type ShipOutRuntime } from "./shipout-runtime";
 
 /** Handle returned by `startGateway`; hosts and tests drive lifecycle through it. */
 export interface StartedGateway {
@@ -38,6 +41,7 @@ export interface StartGatewayOptions {
   configPath?: string;
   port?: number;
   fetchImpl?: typeof fetch;
+  /** Test/embedding hook; production defaults to a conservative 60-second maintenance interval. */
   retryIntervalMs?: number;
   /** Set false in tests so the suite's own process signals stay untouched. */
   installSignalHandlers?: boolean;
@@ -51,6 +55,8 @@ interface Wiring {
   config: GatewayConfig;
   /** Present only when `config.ingest` is set: drains the ship-out outbox to the cloud. */
   ingestDispatcher?: OutboxDispatcher;
+  /** Same durable adapter used by the dispatcher and sanitized health inspection. */
+  ingestOutbox?: OutboxAdapter;
 }
 
 /** Loads and validates config + pricing catalog from disk (fail closed on both). */
@@ -88,12 +94,25 @@ export async function startGateway(options: StartGatewayOptions = {}): Promise<S
     // cloud outages only grow the outbox, traffic is never blocked.
     let store: GatewayEvidenceSink = localStore;
     let ingestDispatcher: OutboxDispatcher | undefined;
+    let ingestOutbox: OutboxAdapter | undefined;
     if (config.ingest !== undefined) {
-      const outbox = createFileOutboxAdapter(join(config.evidenceDir, "outbox"));
+      // The ship-out outbox is hard-bounded: in the default `held` startup
+      // mode nothing drains it, so without this ceiling a long-lived gateway
+      // would grow entries.json until the evidence volume fills. Once full,
+      // new remote-delivery copies are refused (sink logs the hold) while the
+      // authoritative local store keeps recording.
+      const outbox = createFileOutboxAdapter(join(config.evidenceDir, "outbox"), {
+        maxQueuedBytes: DEFAULT_DELIVERY_SAFETY_POLICY.hard.queuedBytes,
+      });
+      ingestOutbox = outbox;
       store = createShipOutSink(localStore, { outbox, tenantId: config.tenantId });
       ingestDispatcher = createHttpOutboxDispatcher({
         adapter: outbox,
-        target: createHttpIngestTarget({ baseUrl: config.ingest.url, key: config.ingest.key }),
+        target: createHttpIngestTarget({
+          baseUrl: config.ingest.url,
+          key: config.ingest.key,
+          timeoutMs: config.ingest.canary.maxElapsedMs,
+        }),
       });
     }
     const evidence = createGatewayEvidence(store, { tenantId: config.tenantId, gatewayId: config.gatewayId });
@@ -111,13 +130,15 @@ export async function startGateway(options: StartGatewayOptions = {}): Promise<S
       store,
       config,
       ...(ingestDispatcher === undefined ? {} : { ingestDispatcher }),
+      ...(ingestOutbox === undefined ? {} : { ingestOutbox }),
     };
   }
 
   let current = await buildWiring();
   failureMode = current.config.evidenceFailureMode;
 
-  const retryTimer = setInterval(async () => {
+  /** Retries local evidence and records gap markers before a remote canary is considered. */
+  async function runMaintenance(): Promise<void> {
     const generation = current;
     await health.retryPending((outcome) => generation.evidence.record(outcome));
     // Emit the gap marker only once the sink demonstrably works again
@@ -138,14 +159,37 @@ export async function startGateway(options: StartGatewayOptions = {}): Promise<S
         console.error("veritio-gateway: failed to record evidence gap marker; will retry");
       }
     }
-    // Drain the cloud ship-out outbox last; per-entry failures are handled
-    // inside the dispatcher (retryable stays pending, 4xx dead-letters).
-    try {
-      await generation.ingestDispatcher?.dispatchBatch();
-    } catch {
-      console.error("veritio-gateway: cloud ingest dispatch pass failed; will retry");
-    }
-  }, options.retryIntervalMs ?? 5000);
+  }
+
+  /** Resolves the current reload-safe one-canary delivery generation. */
+  function currentDelivery(): ShipOutDeliveryGeneration | undefined {
+    const generation = current;
+    const ingest = generation.config.ingest;
+    if (!ingest || !generation.ingestDispatcher || !generation.ingestOutbox) return undefined;
+    return {
+      tenantId: generation.config.tenantId,
+      startupMode: ingest.startupMode,
+      permit: {
+        kind: "automatic",
+        maxEntries: 1,
+        maxBytes: ingest.canary.maxBytes,
+        maxElapsedMs: ingest.canary.maxElapsedMs,
+        leaseMs: ingest.canary.leaseMs,
+      },
+      outbox: generation.ingestOutbox,
+      dispatcher: generation.ingestDispatcher,
+    };
+  }
+
+  const shipOutRuntime: ShipOutRuntime = createShipOutRuntime({
+    intervalMs: options.retryIntervalMs ?? 60_000,
+    maintenance: runMaintenance,
+    delivery: currentDelivery,
+    onError(stage) {
+      console.error(`veritio-gateway: ${stage} maintenance stage failed; delivery remains held`);
+    },
+  });
+  shipOutRuntime.start();
 
   const server = Bun.serve({
     port,
@@ -158,6 +202,7 @@ export async function startGateway(options: StartGatewayOptions = {}): Promise<S
           JSON.stringify({
             status: healthy ? "ok" : "evidence_unavailable",
             pendingEvidence: current.health.pendingCount(),
+            shipOut: shipOutRuntime.snapshot(),
           }),
           { status: healthy ? 200 : 503, headers: { "content-type": "application/json" } },
         );
@@ -187,7 +232,7 @@ export async function startGateway(options: StartGatewayOptions = {}): Promise<S
     port: server.port ?? port,
     reload,
     stop() {
-      clearInterval(retryTimer);
+      shipOutRuntime.stop();
       if (options.installSignalHandlers !== false) process.off("SIGHUP", onSighup);
       server.stop(true);
     },

@@ -7,11 +7,24 @@ import {
   createFileOutboxAdapter,
   createHttpIngestTarget,
   createHttpOutboxDispatcher,
+  DEFAULT_DELIVERY_SAFETY_POLICY,
 } from "@veritio/storage";
 import { buildOutcomeEvent, type RequestOutcome } from "./evidence";
 import { createShipOutSink } from "./shipout";
 
 const CFG = { tenantId: "tenant_ship", gatewayId: "gw_ship" };
+
+/** Creates a finite operator permit for direct dispatcher integration tests. */
+function permit(approvalId: string) {
+  return {
+    kind: "operator" as const,
+    approvalId,
+    maxEntries: 10,
+    maxBytes: DEFAULT_DELIVERY_SAFETY_POLICY.hard.rollingSendBytes,
+    maxElapsedMs: 5_000,
+    leaseMs: 30_000,
+  };
+}
 
 function outcome(requestId: string): RequestOutcome {
   return {
@@ -83,6 +96,24 @@ describe("createShipOutSink", () => {
     expect(warned).toEqual([record.event.id]);
   });
 
+  test("a full outbox drops only the remote copy and reports the hold reason", async () => {
+    const { evidenceDir, outboxDir } = tempDirs();
+    const store = createFileEvidenceStore(evidenceDir);
+    // A ceiling smaller than one gateway event: the very first enqueue holds.
+    const outbox = createFileOutboxAdapter(outboxDir, { maxQueuedBytes: 10 });
+    const warned: Array<{ eventId: string; reason: string }> = [];
+    const sink = createShipOutSink(store, {
+      outbox,
+      tenantId: CFG.tenantId,
+      onEnqueueError: (eventId, reason) => warned.push({ eventId, reason }),
+    });
+
+    const record = await sink.recordEvent(buildOutcomeEvent(outcome("req_1"), CFG));
+    expect(record.sequence).toBe(1); // authoritative local append still succeeded
+    expect(warned).toEqual([{ eventId: record.event.id, reason: "queue_full" }]);
+    expect(await outbox.listDispatchable()).toHaveLength(0);
+  });
+
   test("outbox drains to an ingest endpoint via the HTTP dispatcher; failures stay pending", async () => {
     const { evidenceDir, outboxDir } = tempDirs();
     const store = createFileEvidenceStore(evidenceDir);
@@ -109,14 +140,14 @@ describe("createShipOutSink", () => {
     });
 
     // Ingest down: entries stay pending (retryable 503), nothing lost.
-    const down = await dispatcher.dispatchBatch();
-    expect(down).toEqual({ dispatched: 0, failed: 2 });
+    const down = await dispatcher.dispatchBatch({ tenantId: CFG.tenantId, permit: permit("down") });
+    expect(down).toMatchObject({ dispatched: 0, retried: 1, paused: 0, rejected: 0 });
     expect(await outbox.listDispatchable()).toHaveLength(2);
 
     // Ingest recovers: both entries deliver with the scoped key.
     ingestUp = true;
-    const up = await dispatcher.dispatchBatch();
-    expect(up).toEqual({ dispatched: 2, failed: 0 });
+    const up = await dispatcher.dispatchBatch({ tenantId: CFG.tenantId, permit: permit("up") });
+    expect(up).toMatchObject({ dispatched: 2, retried: 0, paused: 0, rejected: 0 });
     expect(received).toHaveLength(2);
     expect(received.every((r) => r.auth === "Bearer vrt_test_key" && r.events === 1)).toBe(true);
     expect(await outbox.listDispatchable()).toHaveLength(0);

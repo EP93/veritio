@@ -12,9 +12,11 @@ not depend on the agent choosing to report. A companion MCP server lets a human 
 another agent list sessions, inspect a session's provenance graph, and export a
 verifiable bundle.
 
-> **Privacy:** raw prompts, tool inputs (Bash commands, MCP arguments — which can
-> carry secrets), and file contents/diffs are **never** persisted. Only stable ids
-> and content hashes travel. Redaction runs in the hook before anything reaches a sink.
+> **Privacy:** raw prompts, tool argument payloads (Bash commands, MCP arguments —
+> which can carry secrets), and file contents/diffs are **never** persisted.
+> Stable ids and content hashes travel. Raw file paths can be retained temporarily
+> in local per-session state to pair a pre-image with its post-image; they are not
+> sent as evidence metadata. Redaction runs before anything reaches a sink.
 
 ## What is captured
 
@@ -49,6 +51,15 @@ bundler/Bun-resolved). Add to your project's `.claude/settings.json`
 
 The hook always exits `0` — a logging hook never blocks the agent.
 
+Install an exact reviewed version in repositories and hosted runners; do not
+use an unversioned `bunx` command. The bundled plugin pins
+`@veritio/claude-code@0.4.7`. Treat it as unavailable until exact registry
+readback succeeds; the plugin must fail closed rather than fall back to 0.4.5.
+
+The `veritio` CLI device-login helper is not published yet. From a repository
+checkout, build it with `bun run --cwd cli build` and invoke
+`bun cli/dist/index.js login claude`; do not assume a global `veritio` binary.
+
 ## Configuration (environment)
 
 Read only at the process boundary; no credential is embedded in the hook.
@@ -62,21 +73,74 @@ Read only at the process boundary; no credential is embedded in the hook.
 | `VERITIO_ENVIRONMENT` | `development` | Scope environment |
 | `VERITIO_WORKSPACE_ID` | — | Optional workspace scope |
 | `VERITIO_INGEST_URL` + `VERITIO_INGEST_KEY` | — | If **both** set, also POST records to a Veritio ingest endpoint (e.g. Veritio Cloud), so captured sessions surface in the hosted Sessions UI. The server re-redacts. |
-| `VERITIO_INGEST_TIMEOUT_MS` | `10000` | Abort bound (ms) for one ingest POST. A stalled endpoint can never block the agent past this bound; the hook still exits 0 (capture is fail-open, the local store already has the records). |
+| `VERITIO_INGEST_TIMEOUT_MS` | `10000` | Abort bound (ms) for one ingest POST, constrained to `1..30000`. The hook still exits 0 because the local store is authoritative for capture. |
+| `VERITIO_SPOOL_HARD_BATCHES` | `250` | Optional lower queue batch ceiling. It cannot raise the compiled-in hard ceiling. |
+| `VERITIO_SPOOL_HARD_BYTES` | `50000000` | Optional lower queue byte ceiling. It cannot raise the compiled-in hard ceiling. |
 
-### Offline spool (ingest outages)
+### Durable delivery queue
 
-When a ship-out fails for a **retryable** reason (endpoint unreachable, timeout,
-HTTP 5xx/429 — e.g. the hosted tenant database being temporarily unavailable),
-the batch is queued under `<localDir>/spool/` and replayed by later hook
-invocations once the endpoint recovers, oldest first, a few batches per hook so
-the hook time bound holds. Replay is safe because record ids are deterministic
-and server ingest is idempotent. Permanent rejections (other 4xx: bad key,
-tenant mismatch, malformed batch) are never queued. The queue is capped at
-1,000 batches (oldest dropped first, with a stderr note); spooled files contain
-exactly the redacted, hash-only payload the wire would have carried. The spool
-is currently TypeScript-only — a Python/Go capture adapter must reproduce this
-ship-out behavior (see `.claude/rules/02-sdk-parity.md`).
+Remote delivery has three durable outcomes:
+
+- `retry`: transport failures, HTTP 429, and legacy 5xx responses remain in the
+  pending queue.
+- `pause`: an explicit server pause (including recognized legacy quota codes)
+  opens a sticky circuit and moves the entire queue to held. Later hooks append
+  locally and make **zero** remote attempts.
+- `reject`: permanent failures are moved to quarantine with the redacted payload
+  intact; they are never silently deleted.
+
+Ordinary hook invocations never replay a backlog. Recovery requires a separate
+operator command and every replay epoch is bounded by batches, records, encoded
+bytes, and elapsed time. This prevents an endpoint recovery, quota upgrade, or
+misclassified provider failure from turning many routine hooks into an
+uncontrolled egress drain.
+
+The queue lives under `<localDir>/spool/` with `pending`, `held`, and
+`quarantine` states. The hard ceiling is 250 batches or 50 MB. At the ceiling,
+existing entries are retained, pending entries move to held, and the newest
+remote-delivery copy is refused with a visible stderr signal. Older flat spool
+files upgrade into a manual hold; they do not auto-replay.
+
+Use the operator CLI to inspect and control delivery:
+
+```sh
+veritio-claude-code-spool status
+veritio-claude-code-spool pause --reason "provider transfer alarm"
+veritio-claude-code-spool quarantine
+
+# At most one request, 500 records / 1 MB / 5 seconds.
+veritio-claude-code-spool canary
+
+# Every drain budget is mandatory and is checked before each request.
+veritio-claude-code-spool drain \
+  --max-batches 10 \
+  --max-records 5000 \
+  --max-bytes 10000000 \
+  --max-elapsed-ms 15000
+
+# Resume only moves held entries back to pending; it performs no network I/O.
+veritio-claude-code-spool resume --acknowledge "provider headroom reviewed"
+```
+
+`status`, `pause`, `resume`, and `quarantine` work without ingest credentials.
+`canary` and `drain` require both ingest variables. CLI output contains queue
+metadata, never event payloads or credentials. Spool payload files contain the
+same redacted, hash-only batch prepared for the wire. The queue is currently
+TypeScript-only; another capture adapter must reproduce the same disposition
+and replay-permit semantics (see `.claude/rules/02-sdk-parity.md`).
+
+### GitHub-hosted Claude Code
+
+Anthropic's GitHub Action has its own paid model/API and runner exposure. Bound
+that workflow separately with a narrow event trigger, GitHub `concurrency`, a
+job `timeout-minutes`, and Claude's `--max-turns`. Veritio's hook and spool do
+not cap Claude tokens or GitHub runner minutes.
+
+If the action is configured to load repository Claude hooks, install the exact
+reviewed `@veritio/claude-code` version before it runs and pass Veritio ingest
+credentials only through GitHub Secrets. Omit those credentials for local-only
+artifact capture. Never run the stress suite or a spool drain from a pull-request
+workflow; CI uses synthetic hooks and no paid provider credentials.
 
 ## Query + export (MCP)
 

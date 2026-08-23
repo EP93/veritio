@@ -57,6 +57,19 @@
       "sourceTreeId": "tree_fixture",
       "resultVersion": 3,
       "expected": "evt_filechange__tree_fixture__3"
+    },
+    {
+      "name": "file-change event id uses the literal x sentinel when resultVersion is absent",
+      "kind": "file_change",
+      "sourceTreeId": "tree_fixture",
+      "resultVersion": null,
+      "expected": "evt_filechange__tree_fixture__x"
+    },
+    {
+      "name": "tool event id is the caller's tool-call id occurrence identity",
+      "kind": "tool",
+      "toolCallId": "tool_call_fixture_01",
+      "expected": "evt_tool__tool_call_fixture_01"
     }
   ]
 }

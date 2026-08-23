@@ -1,6 +1,24 @@
 import { describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildCaptureEnv, buildCodexWrapper } from "../agent-config.js";
 import { extractNotify, type LoginDeps, parseLoginArgs, runLogin, upsertNotify } from "../login.js";
+
+/**
+ * Reads the wrapper's call log as lines, treating a not-yet-created file as
+ * empty. The log is written by a detached background process, so polling must
+ * tolerate the window before the first write instead of throwing ENOENT.
+ */
+function readLogLines(logPath: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(logPath, "utf8").trim();
+  } catch {
+    return [];
+  }
+  return text === "" ? [] : text.split("\n");
+}
 
 describe("parseLoginArgs", () => {
   test("defaults to both agents against prod console", () => {
@@ -34,6 +52,48 @@ describe("codex config surgery", () => {
     expect(wrapper).toContain("'/existing/notifier' 'turn-ended' \"$@\" || true");
     expect(wrapper).toContain("nohup 'veritio-codex-notify' \"$@\" >/dev/null 2>&1 &");
   });
+
+  test("an executed wrapper invokes the original notifier and capture exactly once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "veritio-codex-wrapper-"));
+    try {
+      const logPath = join(dir, "calls.log");
+      const envPath = join(dir, "capture.env");
+      const originalPath = join(dir, "original.sh");
+      const capturePath = join(dir, "capture.sh");
+      const wrapperPath = join(dir, "wrapper.sh");
+      writeFileSync(envPath, "VERITIO_TENANT_ID=test\n", "utf8");
+      writeFileSync(originalPath, `#!/bin/bash\necho original >> '${logPath}'\n`, "utf8");
+      writeFileSync(capturePath, `#!/bin/bash\necho capture >> '${logPath}'\n`, "utf8");
+      writeFileSync(wrapperPath, buildCodexWrapper(capturePath, [originalPath], envPath), "utf8");
+      chmodSync(originalPath, 0o755);
+      chmodSync(capturePath, 0o755);
+      chmodSync(wrapperPath, 0o755);
+
+      const process = Bun.spawn(
+        ["/bin/bash", "-c", '"$1" turn-complete\nsleep 0.2', "--", wrapperPath],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      expect(await process.exited).toBe(0);
+      // Capture is deliberately detached (`nohup … &`) so it never blocks a
+      // Codex turn, which means it is reparented and outlives the wrapper's
+      // shell: the wrapper exiting proves nothing about capture having run.
+      // Poll the observable side effect against a generous ceiling instead of
+      // a short fixed budget — a tight window made this flaky on a loaded
+      // machine while proving nothing extra on an idle one.
+      const deadline = Date.now() + 5_000;
+      let lines = readLogLines(logPath);
+      while (lines.length < 2 && Date.now() < deadline) {
+        await Bun.sleep(10);
+        lines = readLogLines(logPath);
+      }
+      // Let a duplicate invocation land before asserting, so "exactly once"
+      // is actually proven rather than raced past the moment two lines exist.
+      await Bun.sleep(100);
+      expect(readLogLines(logPath).sort()).toEqual(["capture", "original"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /** A scripted fetch + spy deps for the device flow. */
@@ -42,6 +102,7 @@ function harness(pollScript: unknown[]) {
   const written: string[] = [];
   let pollIndex = 0;
   const deps: LoginDeps = {
+    codexNotifyBin: "/workspace/adapters/codex/dist/notify.js",
     fetch: (async (url: string | URL | Request) => {
       const u = String(url);
       const body = u.endsWith("/api/device/code")
@@ -96,6 +157,8 @@ describe("runLogin device flow", () => {
     expect(files["__codex_config__"]).toContain('notify = ["');
     const wrapper = Object.entries(files).find(([p]) => p.endsWith("notify-wrapper.sh"));
     expect(wrapper![1]).toContain("/existing/notifier");
+    expect(wrapper![1]).toContain("'/workspace/adapters/codex/dist/notify.js'");
+    expect(wrapper![1]).not.toContain("'veritio-codex-notify'");
   });
 
   test("expired: exits 1 and writes no credentials", async () => {
@@ -103,5 +166,32 @@ describe("runLogin device flow", () => {
     const code = await runLogin(parseLoginArgs(["login", "codex"]), deps);
     expect(code).toBe(1);
     expect(Object.keys(files).some((p) => p.endsWith("credentials.json"))).toBe(false);
+  });
+
+  test("running Codex login twice preserves one managed wrapper without self-recursion", async () => {
+    const { deps, files } = harness([
+      { status: "approved", token: "vrt_first", projectId: "proj_x" },
+      { status: "approved", token: "vrt_second", projectId: "proj_x" },
+    ]);
+    let config = 'model = "gpt-5"\nnotify = ["/existing/notifier", "turn-ended"]\n';
+    let wrapperWrites = 0;
+    deps.readCodexConfig = async () => config;
+    deps.writeCodexConfig = async (contents) => {
+      config = contents;
+      files["__codex_config__"] = contents;
+    };
+    const originalWriteFile = deps.writeFile;
+    deps.writeFile = async (path, contents, mode) => {
+      if (path.endsWith("notify-wrapper.sh")) wrapperWrites += 1;
+      await originalWriteFile(path, contents, mode);
+    };
+
+    expect(await runLogin(parseLoginArgs(["login", "codex"]), deps)).toBe(0);
+    expect(await runLogin(parseLoginArgs(["login", "codex"]), deps)).toBe(0);
+
+    const wrapper = Object.entries(files).find(([path]) => path.endsWith("notify-wrapper.sh"));
+    expect(wrapperWrites).toBe(1);
+    expect(wrapper![1]).toContain("'/existing/notifier' 'turn-ended'");
+    expect(wrapper![1]).not.toContain(`'${wrapper![0]}'`);
   });
 });

@@ -94,12 +94,60 @@ describe("parseGatewayConfig", () => {
     expect(parseGatewayConfig(withIngest).ingest).toEqual({
       url: "https://console.getveritio.com",
       key: "vrt_scoped",
+      startupMode: "held",
+      canary: { maxBytes: 250_000, maxElapsedMs: 5_000, leaseMs: 30_000 },
     });
     expect(parseGatewayConfig(validRaw()).ingest).toBeUndefined();
 
     const missingKey = validRaw();
     missingKey.ingest = { url: "https://console.getveritio.com" };
     expect(fieldOf(() => parseGatewayConfig(missingKey))).toBe("ingest.key");
+  });
+
+  test("an explicit startup canary remains finite and may only lower hard ceilings", () => {
+    const raw = validRaw();
+    raw.ingest = {
+      url: "https://console.getveritio.com",
+      key: "vrt_scoped",
+      startupMode: "canary",
+      canary: { maxBytes: 100_000, maxElapsedMs: 1_000, leaseMs: 5_000 },
+    };
+
+    expect(parseGatewayConfig(raw).ingest).toMatchObject({
+      startupMode: "canary",
+      canary: { maxBytes: 100_000, maxElapsedMs: 1_000, leaseMs: 5_000 },
+    });
+  });
+
+  test("rejects unbounded or expanded canary controls without echoing the ingest key", () => {
+    const cases: Array<[string, unknown]> = [
+      ["ingest.startupMode", "drain"],
+      ["ingest.canary.maxBytes", 1_048_577],
+      ["ingest.canary.maxElapsedMs", 15_001],
+      ["ingest.canary.maxElapsedMs", Number.POSITIVE_INFINITY],
+      ["ingest.canary.leaseMs", 1_000],
+    ];
+    for (const [field, value] of cases) {
+      const raw = validRaw();
+      raw.ingest = {
+        url: "https://console.getveritio.com",
+        key: "vrt_must_not_leak",
+        startupMode: "canary",
+        canary: { maxBytes: 250_000, maxElapsedMs: 5_000, leaseMs: 30_000 },
+      };
+      const segments = field.split(".").slice(1);
+      let cursor = raw.ingest as Record<string, unknown>;
+      for (const segment of segments.slice(0, -1)) cursor = cursor[segment] as Record<string, unknown>;
+      cursor[segments.at(-1)!] = value;
+      try {
+        parseGatewayConfig(raw);
+        throw new Error("expected config failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(GatewayConfigError);
+        expect((error as GatewayConfigError).field).toBe(field);
+        expect(String(error)).not.toContain("vrt_must_not_leak");
+      }
+    }
   });
 
   test("never echoes config values in error messages", () => {

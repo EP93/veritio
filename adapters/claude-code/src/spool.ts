@@ -1,155 +1,324 @@
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
-import type { AuditEvent, EvidenceEdge } from "@veritio/core";
 
-import { isRetryableIngestFailure, postToIngest } from "./ingest.js";
+import { deliveryDispositionOf, IngestHttpError, postToIngest } from "./ingest.js";
+import {
+  appendForState,
+  holdQueueFull,
+  pauseSpool,
+  saveToSpool,
+  validateSpoolLimits,
+  wouldExceedLimits,
+} from "./spool-control.js";
+import {
+  acquireDirectoryLock,
+  createEntry,
+  ensureLayout,
+  entryNames,
+  moveEntry,
+  prepareQueue,
+  readEntry,
+  spoolDir,
+  stateDir,
+  withMutationLock,
+  writeEntry,
+  writeState,
+} from "./spool-files.js";
+import {
+  DEFAULT_SPOOL_LIMITS,
+  FLUSH_TIMEOUT_MS,
+  MAX_REPLAY_PERMIT,
+  type ReplayPermit,
+  type ReplayResult,
+  type SpoolEntry,
+  type SpoolLimits,
+  type SpoolPayload,
+} from "./spool-types.js";
 
-/**
- * Offline spool for ingest ship-outs (July 2026 incident: the hosted tenant DB
- * was quota-blocked for weeks and every capture batch was silently dropped).
- * A batch that fails for a RETRYABLE reason (transport outage, 5xx, 429) is
- * written to `<localDir>/spool/` and replayed by later hook invocations once
- * the endpoint recovers. Replay is safe because record ids are deterministic
- * and server ingest is idempotent — a batch that half-landed simply replays.
- * Spooled bytes are exactly the redacted payload that would have been POSTed
- * (hashes only, redaction already ran), so nothing new lands on disk that the
- * wire would not have carried. TypeScript-only for now — a Python/Go capture
- * adapter must reproduce this ship-out behavior (parity TODO, see
- * .claude/rules/02-sdk-parity.md).
- */
-export interface SpoolPayload {
-  events: AuditEvent[];
-  edges: EvidenceEdge[];
+export {
+  inspectSpool,
+  listSpool,
+  pauseSpool,
+  quarantinedSpoolEntries,
+  resumeSpool,
+  saveToSpool,
+} from "./spool-control.js";
+export * from "./spool-types.js";
+
+interface EntryLocation {
+  entry: SpoolEntry;
+  name: string;
+  state: "pending" | "held";
 }
 
-/** Hard cap on queued batches; at the cap the OLDEST batch is dropped (with a
- * stderr note) so a weeks-long outage bounds disk instead of growing forever.
- * Recent evidence wins because it is the evidence most likely to be inspected. */
-export const MAX_SPOOL_BATCHES = 1_000;
+const REPLAY_LOCK_STALE_MS = 60_000;
 
-/** Batches replayed per hook invocation. Small on purpose: a hook's whole
- * budget is bounded (a stalled ship-out once froze Claude Code), so drain
- * happens a little per event across the many hooks of a working session. */
-export const FLUSH_BATCHES_PER_HOOK = 3;
-
-/** Per-attempt bound during replay, tighter than the primary ship-out bound so
- * a drain of FLUSH_BATCHES_PER_HOOK batches cannot triple a hook's worst case. */
-export const FLUSH_TIMEOUT_MS = 5_000;
-
-function spoolDir(localDir: string): string {
-  return join(localDir, "spool");
+/** Returns whether one permit dimension is a positive integer under its hard ceiling. */
+function isFinitePositiveWithin(value: unknown, maximum: number): boolean {
+  return Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= maximum;
 }
 
-/** In-process save counter: hooks normally spool one batch per process, but a
- * same-millisecond second save (tests, future multi-batch hooks) must never
- * overwrite the first, so names carry a monotonic sequence too. */
-let saveSeq = 0;
-
-/** Lexicographically sortable name: zero-padded epoch millis, then an
- * in-process sequence, then pid (disambiguates same-millisecond hooks from
- * different processes). Name order is the replay order. */
-function spoolFileName(): string {
-  saveSeq += 1;
-  return `${String(Date.now()).padStart(15, "0")}-${String(saveSeq).padStart(4, "0")}-${process.pid}.json`;
-}
-
-/** Queued batch file names, oldest first (name order = arrival order). */
-export function listSpool(localDir: string): string[] {
-  try {
-    return readdirSync(spoolDir(localDir))
-      .filter((name) => name.endsWith(".json"))
-      .sort();
-  } catch {
-    return []; // No spool directory yet — nothing queued.
+/** Validates that a replay request is finite, bounded, and explicit. */
+function validateReplayPermit(permit: ReplayPermit | undefined): asserts permit is ReplayPermit {
+  if (
+    !permit ||
+    typeof permit.id !== "string" ||
+    !permit.id.trim() ||
+    (permit.kind !== "canary" && permit.kind !== "drain") ||
+    !isFinitePositiveWithin(permit.maxBatches, MAX_REPLAY_PERMIT.maxBatches) ||
+    !isFinitePositiveWithin(permit.maxRecords, MAX_REPLAY_PERMIT.maxRecords) ||
+    !isFinitePositiveWithin(permit.maxBytes, MAX_REPLAY_PERMIT.maxBytes) ||
+    !isFinitePositiveWithin(permit.maxElapsedMs, MAX_REPLAY_PERMIT.maxElapsedMs) ||
+    (permit.kind === "canary" && permit.maxBatches !== 1) ||
+    (permit.kind === "canary" && permit.maxRecords > 500)
+  ) {
+    throw new Error("flush requires a finite replay permit within hard safety bounds");
   }
 }
 
-/**
- * Queues one failed batch, evicting oldest entries past {@link MAX_SPOOL_BATCHES}.
- * Best-effort: a spool write failure only logs — capture must never throw into
- * the hook over its own fallback.
- */
-export function saveToSpool(localDir: string, payload: SpoolPayload): void {
-  try {
-    mkdirSync(spoolDir(localDir), { recursive: true });
-    const queued = listSpool(localDir);
-    for (const name of queued.slice(0, Math.max(0, queued.length + 1 - MAX_SPOOL_BATCHES))) {
-      rmSync(join(spoolDir(localDir), name), { force: true });
-      process.stderr.write("veritio-claude-code: spool full, dropped oldest batch\n");
+/** Selects the oldest held batch during a circuit, otherwise the oldest pending batch. */
+function oldestReplayEntry(localDir: string): EntryLocation | null {
+  return withMutationLock(localDir, () => {
+    const state = prepareQueue(localDir);
+    const held = entryNames(localDir, "held")[0];
+    const pending = entryNames(localDir, "pending")[0];
+    const selectedState = state.circuit && held ? "held" : pending ? "pending" : held ? "held" : null;
+    const name = selectedState === "held" ? held : selectedState === "pending" ? pending : undefined;
+    if (!selectedState || !name) return null;
+    try {
+      return {
+        entry: readEntry(join(stateDir(localDir, selectedState), name)),
+        name,
+        state: selectedState,
+      };
+    } catch {
+      moveEntry(localDir, name, selectedState, "quarantine");
+      return null;
     }
-    writeFileSync(join(spoolDir(localDir), spoolFileName()), JSON.stringify(payload), "utf8");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown error";
-    process.stderr.write(`veritio-claude-code: spool write failed: ${message}\n`);
-  }
+  });
+}
+
+/** Finds an entry that may have moved between pending and held during a request. */
+function findActiveState(localDir: string, name: string): "pending" | "held" | null {
+  if (entryNames(localDir, "pending").includes(name)) return "pending";
+  if (entryNames(localDir, "held").includes(name)) return "held";
+  return null;
+}
+
+/** Deletes a successfully dispatched entry under the queue mutation lock. */
+function removeDispatchedEntry(localDir: string, name: string): void {
+  withMutationLock(localDir, () => {
+    const activeState = findActiveState(localDir, name);
+    if (activeState) rmSync(join(stateDir(localDir, activeState), name), { force: true });
+  });
+}
+
+/** Records a retry outcome without deleting or silently transforming payload bytes. */
+function retainRetryEntry(localDir: string, location: EntryLocation, error: unknown): void {
+  withMutationLock(localDir, () => {
+    const activeState = findActiveState(localDir, location.name);
+    if (!activeState) return;
+    const details = error instanceof IngestHttpError ? error : undefined;
+    writeEntry(localDir, activeState, location.name, {
+      ...location.entry,
+      attempts: location.entry.attempts + 1,
+      disposition: "retry",
+      ...(details?.code ? { code: details.code } : {}),
+      ...(details?.retryAt ? { retryAt: details.retryAt } : {}),
+    });
+  });
+}
+
+/** Moves a rejected entry to durable quarantine with bounded response metadata. */
+function quarantineEntry(localDir: string, location: EntryLocation, error: unknown): void {
+  withMutationLock(localDir, () => {
+    const activeState = findActiveState(localDir, location.name);
+    if (!activeState) return;
+    const details = error instanceof IngestHttpError ? error : undefined;
+    writeEntry(localDir, activeState, location.name, {
+      ...location.entry,
+      attempts: location.entry.attempts + 1,
+      disposition: "reject",
+      ...(details?.code ? { code: details.code } : {}),
+      reason: details
+        ? `Remote ingest rejected the batch with HTTP ${details.status}.`
+        : "Remote ingest rejected the batch.",
+    });
+    moveEntry(localDir, location.name, activeState, "quarantine");
+  });
+}
+
+/** Persists a newly rejected direct ship-out without bypassing shared queue bounds. */
+function quarantinePayload(
+  localDir: string,
+  payload: SpoolPayload,
+  error: unknown,
+  limits: SpoolLimits,
+): "quarantined" | "full" {
+  return withMutationLock(localDir, () => {
+    const state = prepareQueue(localDir);
+    if (state.queueFull || wouldExceedLimits(localDir, payload, limits)) {
+      holdQueueFull(localDir, state);
+      return "full";
+    }
+    const created = createEntry(state, payload);
+    const details = error instanceof IngestHttpError ? error : undefined;
+    created.entry.attempts = 1;
+    created.entry.disposition = "reject";
+    if (details?.code) created.entry.code = details.code;
+    created.entry.reason = details
+      ? `Remote ingest rejected the batch with HTTP ${details.status}.`
+      : "Remote ingest rejected the batch.";
+    writeEntry(localDir, "quarantine", created.name, created.entry);
+    writeState(localDir, state);
+    return "quarantined";
+  });
+}
+
+/** Converts a pause response into a sticky circuit and holds the entire queue. */
+function holdForPause(localDir: string, error: unknown): void {
+  const details = error instanceof IngestHttpError ? error : undefined;
+  pauseSpool(localDir, {
+    code: details?.code ?? "remote_delivery_paused",
+    reason: details ? `Remote ingest paused delivery with HTTP ${details.status}.` : "Remote ingest paused delivery.",
+    ...(details?.circuitId ? { circuitId: details.circuitId } : {}),
+    ...(details?.retryAt ? { retryAt: details.retryAt } : {}),
+  });
 }
 
 /**
- * Replays up to `maxBatches` queued batches, oldest first. Stops at the first
- * retryable failure (the endpoint is still down — later hooks will resume) and
- * DELETES a batch on success or on a permanent rejection (a batch the server
- * refuses would poison the queue head forever; dropping it matches the
- * pre-spool behavior for that batch, with a stderr note for the operator).
+ * Replays only under an explicit finite permit. Aggregate batch, record, byte,
+ * and elapsed budgets are checked before every request; ordinary hooks never
+ * call this function.
  */
 export async function flushSpool(
   ingest: { url: string; key: string; timeoutMs?: number },
   localDir: string,
-  maxBatches = FLUSH_BATCHES_PER_HOOK,
-): Promise<void> {
-  for (const name of listSpool(localDir).slice(0, maxBatches)) {
-    const path = join(spoolDir(localDir), name);
-    let payload: SpoolPayload;
-    try {
-      payload = JSON.parse(readFileSync(path, "utf8")) as SpoolPayload;
-    } catch {
-      // Unreadable/corrupt spool entry can never replay — remove it.
-      rmSync(path, { force: true });
-      process.stderr.write("veritio-claude-code: dropped unreadable spool batch\n");
-      continue;
-    }
-    try {
-      await postToIngest({ ...ingest, timeoutMs: ingest.timeoutMs ?? FLUSH_TIMEOUT_MS }, payload);
-    } catch (error) {
-      if (isRetryableIngestFailure(error)) {
-        return; // Endpoint still down; keep the queue and yield the hook budget.
+  permit: ReplayPermit,
+): Promise<ReplayResult> {
+  validateReplayPermit(permit);
+  ensureLayout(localDir);
+  const releaseReplay = acquireDirectoryLock(join(spoolDir(localDir), ".replay.lock"), 0, REPLAY_LOCK_STALE_MS);
+  const result: ReplayResult = {
+    attemptedBatches: 0,
+    attemptedRecords: 0,
+    attemptedBytes: 0,
+    dispatchedBatches: 0,
+    quarantinedBatches: 0,
+    paused: false,
+  };
+  const startedAt = Date.now();
+  try {
+    while (result.attemptedBatches < permit.maxBatches) {
+      const remainingMs = permit.maxElapsedMs - (Date.now() - startedAt);
+      if (remainingMs < 1) break;
+      const location = oldestReplayEntry(localDir);
+      if (!location) break;
+      if (
+        result.attemptedRecords + location.entry.recordCount > permit.maxRecords ||
+        result.attemptedBytes + location.entry.encodedBytes > permit.maxBytes
+      ) {
+        break;
       }
-      rmSync(path, { force: true });
-      const message = error instanceof Error ? error.message : "unknown error";
-      process.stderr.write(`veritio-claude-code: spool batch permanently rejected (${message})\n`);
-      continue;
+      result.attemptedBatches += 1;
+      result.attemptedRecords += location.entry.recordCount;
+      result.attemptedBytes += location.entry.encodedBytes;
+      try {
+        await postToIngest(
+          { ...ingest, timeoutMs: Math.max(1, Math.min(ingest.timeoutMs ?? FLUSH_TIMEOUT_MS, remainingMs)) },
+          location.entry.payload,
+          "replay-v1",
+        );
+        removeDispatchedEntry(localDir, location.name);
+        result.dispatchedBatches += 1;
+      } catch (error) {
+        const disposition = deliveryDispositionOf(error);
+        if (disposition === "pause") {
+          holdForPause(localDir, error);
+          result.paused = true;
+          break;
+        }
+        if (disposition === "reject") {
+          quarantineEntry(localDir, location, error);
+          result.quarantinedBatches += 1;
+          continue;
+        }
+        retainRetryEntry(localDir, location, error);
+        break;
+      }
     }
-    rmSync(path, { force: true });
+    return result;
+  } finally {
+    releaseReplay();
+  }
+}
+
+/** Atomically queues behind any existing backlog or circuit without dispatching it. */
+function queueIfBlocked(
+  localDir: string,
+  payload: SpoolPayload,
+  limits: SpoolLimits,
+): "queued" | "clear" | "full" | "failed" {
+  try {
+    validateSpoolLimits(limits);
+    return withMutationLock(localDir, () => {
+      const state = prepareQueue(localDir);
+      if (state.queueFull || wouldExceedLimits(localDir, payload, limits)) {
+        holdQueueFull(localDir, state);
+        return "full";
+      }
+      const backlogged = entryNames(localDir, "pending").length + entryNames(localDir, "held").length > 0;
+      if (!state.circuit && !backlogged) return "clear";
+      appendForState(localDir, state, payload);
+      return "queued";
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    process.stderr.write(`veritio-claude-code: queue check failed: ${message}\n`);
+    return "failed";
   }
 }
 
 /**
- * Ship-out entrypoint the hook uses instead of a bare postToIngest. Fast path
- * (empty spool): POST the batch, queueing it only on a retryable failure — a
- * permanent rejection is dropped exactly as before the spool existed. Backlog
- * path: the new batch is queued BEHIND the backlog and the queue drains oldest
- * first, so recovered batches reach the server in original capture order.
+ * Ships only when the durable queue is clear. Any backlog or sticky circuit
+ * turns ordinary capture into append-only local persistence with zero replay.
  */
 export async function shipWithSpool(
   ingest: { url: string; key: string; timeoutMs?: number },
   localDir: string,
   payload: SpoolPayload,
+  limits: SpoolLimits = DEFAULT_SPOOL_LIMITS,
 ): Promise<void> {
-  const backlog = listSpool(localDir).length > 0;
-  if (!backlog) {
-    try {
-      await postToIngest(ingest, payload);
-    } catch (error) {
-      if (isRetryableIngestFailure(error)) {
-        saveToSpool(localDir, payload);
-        process.stderr.write("veritio-claude-code: ingest unavailable, batch spooled for replay\n");
-      } else {
-        throw error; // Permanent rejection: surface exactly as before the spool.
-      }
+  if (payload.events.length === 0 && payload.edges.length === 0) return;
+  const blocked = queueIfBlocked(localDir, payload, limits);
+  if (blocked !== "clear") {
+    if (blocked === "full") {
+      process.stderr.write(
+        "veritio-claude-code: queue full; retained existing evidence and refused newest remote copy\n",
+      );
     }
     return;
   }
-  if (payload.events.length > 0 || payload.edges.length > 0) {
-    saveToSpool(localDir, payload);
+  try {
+    await postToIngest(ingest, payload);
+  } catch (error) {
+    const disposition = deliveryDispositionOf(error);
+    if (disposition === "pause") {
+      holdForPause(localDir, error);
+      saveToSpool(localDir, payload, limits);
+      process.stderr.write("veritio-claude-code: remote delivery paused; batch retained in held queue\n");
+      return;
+    }
+    if (disposition === "reject") {
+      const quarantineResult = quarantinePayload(localDir, payload, error, limits);
+      process.stderr.write(
+        quarantineResult === "quarantined"
+          ? "veritio-claude-code: remote delivery rejected; batch retained in quarantine\n"
+          : "veritio-claude-code: queue full after remote rejection; local evidence remains authoritative\n",
+      );
+      return;
+    }
+    saveToSpool(localDir, payload, limits);
+    process.stderr.write("veritio-claude-code: ingest unavailable; batch retained for explicit replay\n");
   }
-  await flushSpool(ingest, localDir);
 }

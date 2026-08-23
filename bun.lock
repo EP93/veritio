@@ -13,7 +13,7 @@
     },
     "adapters/better-auth": {
       "name": "@veritio/better-auth",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -27,19 +27,19 @@
     },
     "adapters/claude-code": {
       "name": "@veritio/claude-code",
-      "version": "0.4.5",
+      "version": "0.4.7",
       "bin": {
         "veritio-claude-code-hook": "dist/hook.js",
         "veritio-claude-code-mcp": "dist/mcp.js",
       },
       "dependencies": {
-        "@veritio/core": "0.4.3",
-        "@veritio/storage": "0.4.3",
+        "@veritio/core": "0.4.7",
+        "@veritio/storage": "0.4.7",
       },
     },
     "adapters/codex": {
       "name": "@veritio/codex",
-      "version": "0.0.1",
+      "version": "0.0.3",
       "bin": {
         "veritio-codex-notify": "dist/notify.js",
       },
@@ -50,7 +50,7 @@
     },
     "adapters/express": {
       "name": "@veritio/express",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "peerDependencies": {
         "@veritio/core": ">=0.0.0",
         "express": ">=5.2.1",
@@ -61,7 +61,7 @@
     },
     "adapters/hono": {
       "name": "@veritio/hono",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "peerDependencies": {
         "@veritio/core": ">=0.0.0",
         "hono": ">=4.12.25",
@@ -72,7 +72,7 @@
     },
     "adapters/next": {
       "name": "@veritio/next",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -86,7 +86,7 @@
     },
     "adapters/react": {
       "name": "@veritio/react",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "peerDependencies": {
         "react": ">=19.2.7",
       },
@@ -96,7 +96,7 @@
     },
     "adapters/svelte": {
       "name": "@veritio/svelte",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "peerDependencies": {
         "svelte": ">=5.56.3",
       },
@@ -106,7 +106,7 @@
     },
     "adapters/sveltekit": {
       "name": "@veritio/sveltekit",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -120,7 +120,7 @@
     },
     "adapters/tanstack-start": {
       "name": "@veritio/tanstack-start",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "devDependencies": {
         "@veritio/core": "workspace:*",
       },
@@ -134,7 +134,7 @@
     },
     "adapters/trpc": {
       "name": "@veritio/trpc",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "peerDependencies": {
         "@trpc/server": ">=11.17.0",
         "@veritio/core": ">=0.0.0",
@@ -145,7 +145,7 @@
     },
     "adapters/vue": {
       "name": "@veritio/vue",
-      "version": "0.0.3",
+      "version": "0.0.4",
       "peerDependencies": {
         "vue": ">=3.5.38",
       },
@@ -155,18 +155,19 @@
     },
     "cli": {
       "name": "veritio",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "bin": {
         "veritio": "./dist/index.js",
       },
       "dependencies": {
+        "@veritio/codex": "workspace:*",
         "@veritio/core": "workspace:*",
         "@veritio/server": "workspace:*",
       },
     },
     "gateway": {
       "name": "@veritio/gateway",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "dependencies": {
         "@veritio/core": "workspace:*",
         "@veritio/storage": "workspace:*",
@@ -174,18 +175,18 @@
     },
     "sdks/typescript": {
       "name": "@veritio/core",
-      "version": "0.4.4",
+      "version": "0.4.7",
     },
     "server/node": {
       "name": "@veritio/server",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "dependencies": {
         "@veritio/core": "workspace:*",
       },
     },
     "storage": {
       "name": "@veritio/storage",
-      "version": "0.4.4",
+      "version": "0.4.7",
       "devDependencies": {
         "@veritio/core": "workspace:*",
         "mongodb": "^7.3.0",

@@ -1,4 +1,9 @@
-import { createHttpIngestTarget, createHttpOutboxDispatcher, type OutboxAdapter } from "@veritio/storage";
+import {
+  createHttpIngestTarget,
+  createHttpOutboxDispatcher,
+  DEFAULT_DELIVERY_SAFETY_POLICY,
+  type OutboxAdapter,
+} from "@veritio/storage";
 import type { AuditEventInput, EvidenceEdgeInput } from "@veritio/core";
 
 /**
@@ -84,10 +89,18 @@ export interface DispatchResult {
   error?: string;
 }
 
+const AUTOMATIC_DISPATCH_PERMIT = {
+  kind: "automatic" as const,
+  maxEntries: 1,
+  maxBytes: DEFAULT_DELIVERY_SAFETY_POLICY.hard.batchBytes,
+  maxElapsedMs: 5_000,
+  leaseMs: 30_000,
+};
+
 /**
  * Drains the transactional outbox to hosted ingest using the OSS HTTP dispatcher
- * (`@veritio/storage`). On a retryable failure the row stays pending so a later
- * call retries; the sanitized last error is surfaced for the UI. Returns
+ * (`@veritio/storage`). Every automatic pass is one finite canary: retries stay
+ * pending, pauses stay held, and rejected entries are not replayed. Returns
  * `local_only` (no network) when the cloud is not configured.
  */
 export async function dispatchOutboxToCloud(adapter: OutboxAdapter, tenantId: string): Promise<DispatchResult> {
@@ -98,7 +111,9 @@ export async function dispatchOutboxToCloud(adapter: OutboxAdapter, tenantId: st
 
   const target = createHttpIngestTarget({ baseUrl: config.baseUrl, key: config.token });
   const dispatcher = createHttpOutboxDispatcher({ adapter, target });
-  const { dispatched, failed } = await dispatcher.dispatchBatch({ tenantId });
+  const result = await dispatcher.dispatchBatch({ tenantId, permit: AUTOMATIC_DISPATCH_PERMIT });
+  const { dispatched } = result;
+  const failed = result.retried + result.paused + result.rejected;
 
   if (failed > 0) {
     const pending = await adapter.list({ tenantId });

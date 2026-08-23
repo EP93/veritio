@@ -187,17 +187,18 @@ against the real hook binary. Items are OPEN unless marked otherwise.
   corrected in the lockfile text, then validated with plain and
   `--frozen-lockfile` installs, both clean). Still open from this finding:
   add `--frozen-lockfile` to CI installs so the next drift fails loudly.
-- **Destructive-classifier long-form gaps (LOW, runtime-verified).**
-  `rm --recursive` (long flag) classifies as `delete`/`recoverable`, not
-  `destructive` (the regex only matches short-flag groups); `npx rimraf` and
-  `find … -delete` attach no signal. One-line regex additions; update the
-  DESIGN.md classification table in the same commit (mapping is hash-affecting
-  capture contract).
-- **`provenance-ids.json` under-pins two derivations (LOW, confirmed).**
-  `spec/provenance-identity.md` §2 documents the tool-event id
+- **Destructive-classifier long-form gaps (LOW, runtime-verified) —
+  FIXED 2026-07-30.** `rm … --recursive`, `rimraf` (incl. `npx`/`bunx`), and
+  `find … -delete` now classify as `destructive`/`irreversible`; the patterns
+  stay scoped to one shell word group so pipeline segments cannot smear flags
+  onto an unrelated leading command. DESIGN.md classification table updated in
+  the same change (mapping is hash-affecting capture contract); regression
+  tests in `map.test.ts` pin all three plus the piped-command non-match.
+- **`provenance-ids.json` under-pins two derivations (LOW, confirmed) —
+  FIXED 2026-07-30.** The fixture now pins the tool-event id
   (`evt_tool__<toolCallId>`) and the absent-resultVersion file-change sentinel
-  (`…__x`) as normative, but the conformance fixture pins neither — a parity
-  implementer could diverge with nothing catching it. Add both cases.
+  (`…__x`); the TS conformance test executes both through the public recorder
+  surface (`recordToolCall`, `recordFileChange` without `resultVersion`).
 
 ### Landed (this pass)
 
