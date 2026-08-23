@@ -24,10 +24,13 @@ Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while th
 ### Changed
 
 - Released `@veritio/core`, `@veritio/storage`, and `@veritio/claude-code`
-  0.4.7 together with exact internal pins. Publishing still requires the guarded
-  release script and a short-lived npm token.
-- The Claude plugin pins an exact reviewed `@veritio/claude-code` version
-  instead of resolving npm latest on every hook, and
+  0.4.7 as one train. Only `@veritio/claude-code` pins the other two EXACTLY
+  (`@veritio/core` and `@veritio/storage` at `0.4.7`); `@veritio/storage` and
+  the framework adapters continue to declare `@veritio/core` as a peer at
+  `>=0.0.0`. Publishing still requires the guarded release script and a
+  short-lived npm token.
+- The Claude plugin now pins `@veritio/claude-code@0.4.7` exactly on all seven
+  hooks instead of resolving npm latest, and
   `verify:agent-integrations` fails the build unless all seven hooks, the
   Claude Code dependency pins, and `bun.lock` agree with the release version.
   An unavailable exact version fails closed rather than falling back.
@@ -35,9 +38,18 @@ Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while th
   `sveltekit`, `react`, `vue`, `svelte`) move to 0.0.4. They declare
   `@veritio/core` as a peer at `>=0.0.0`, so this is a republish, not a
   compatibility change.
-- The experimental, still-unpublished `@veritio/codex` workspace package moves
-  to 0.0.3 and rejects both env and direct-call ingest timeouts above 30
-  seconds.
+- The experimental, still-unpublished `@veritio/codex` workspace package is at
+  0.0.3 and rejects both env and direct-call ingest timeouts above 30 seconds.
+  The ceiling landed earlier in this release cycle at 0.0.2; 0.0.3 is a
+  version-only bump. Neither version reached a registry.
+- Internal, unpublished packages moved with the train and are listed here only
+  so the version fields are accounted for: `@veritio/express`, `@veritio/hono`,
+  `@veritio/trpc`, and `@veritio/server` to 0.0.2, `@veritio/gateway` to 0.0.2,
+  and the `veritio` CLI to 0.1.1. None are on npm. The Claude Code plugin
+  manifest moves to 0.1.2 and the marketplace catalog to 0.1.1.
+- `@veritio/claude-code` now ships a `veritio-claude-code-spool` operator CLI
+  for inspecting and controlling the durable delivery queue (`status`, `pause`,
+  `quarantine`).
 - `rm --recursive`, `rimraf` (including `npx`/`bunx` invocations), and
   `find … -delete` now classify as destructive/irreversible. Matching is scoped
   to one shell word group so pipeline segments cannot smear flags onto an
