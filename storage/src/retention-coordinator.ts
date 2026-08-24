@@ -41,6 +41,15 @@ export type RetentionPolicyFenceRunner = <T>(
   operation: () => Promise<T>,
 ) => Promise<T>;
 
+/**
+ * Host-owned tenant/chain serialization boundary for a complete retention
+ * epoch. Hosted implementations may use a durable distributed lease; the host
+ * must not invoke `operation` until it exclusively owns that tenant audit chain
+ * and must retain ownership until the promise settles. OSS cannot implement or
+ * prove a cross-process lease on the host's behalf.
+ */
+export type RetentionEpochLeaseRunner = <T>(operation: () => Promise<T>) => Promise<T>;
+
 /** Caller-owned protocol identifiers and exact UTC-millisecond checkpoint time. */
 export interface RetentionCheckpointFactoryInput {
   checkpointId: string;
@@ -72,6 +81,7 @@ export interface RunRetentionEpochOptions {
   createCheckpoint(input: RetentionCheckpointInput): RetentionCheckpoint;
   createDisposition(input: RetentionDispositionInput): RetentionDisposition;
   verification?: RetentionVerificationOptions;
+  withEpochLease: RetentionEpochLeaseRunner;
   withPolicyFence: RetentionPolicyFenceRunner;
 }
 
@@ -83,16 +93,28 @@ export interface RunRetentionEpochResult {
 }
 
 /**
- * Executes the two-stage state machine in the fixed order seal, verify, crop,
- * prepare, delete, dual absence confirmation, receipt creation/verification,
- * and confirmation. Fence one surrounds only final checkpoint validation and
- * crop; fence two is freshly acquired at the same injected version and stays
- * held across every disposal operation. A retry after a policy-version change
- * must supply a fresh decision and attempt id so the authoritative store can
- * supersede the prior pending attempt. Byte-identical completed stages replay
- * idempotently; conflicts and stale boundaries fail closed.
+ * Acquires the required host tenant/chain epoch lease before any validation,
+ * preflight, store call, or provider call. This outer serialization boundary
+ * spans the complete run and is distinct from the two short policy fences.
  */
 export async function runRetentionEpoch(options: RunRetentionEpochOptions): Promise<RunRetentionEpochResult> {
+  if (typeof options.withEpochLease !== "function") {
+    throw new TypeError("withEpochLease is required");
+  }
+  return options.withEpochLease(() => runRetentionEpochUnderLease(options));
+}
+
+/**
+ * Executes the leased two-stage state machine in the fixed order seal, verify,
+ * crop, prepare, delete, dual absence confirmation, receipt verification, and
+ * confirmation. Fence one surrounds final checkpoint validation and crop;
+ * fence two is freshly acquired at the same injected policy version and stays
+ * held across every disposal operation. Byte-identical completed stages replay
+ * idempotently while the outer lease prevents concurrent restaging races.
+ */
+async function runRetentionEpochUnderLease(
+  options: RunRetentionEpochOptions,
+): Promise<RunRetentionEpochResult> {
   validateCoordinatorInputs(options);
   const epoch = (options.previousCheckpoint?.epoch ?? 0) + 1;
   const epochInput = {

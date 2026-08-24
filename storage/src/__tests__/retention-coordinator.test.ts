@@ -114,8 +114,27 @@ async function runOptions(store: CheckpointingAuditStore, client: RetentionStagi
     },
     createCheckpoint: (input: RetentionCheckpointInput) => createRetentionCheckpoint(input),
     createDisposition: (input: RetentionDispositionInput) => createRetentionDisposition(input),
+    withEpochLease: async <T>(operation: () => Promise<T>) => operation(),
     withPolicyFence: (async (_version, operation) => operation()) as RetentionPolicyFenceRunner,
     ...overrides,
+  };
+}
+
+/** Serializes callbacks in FIFO order to model one tenant/chain distributed epoch lease. */
+function createEpochLeaseRunner() {
+  let tail = Promise.resolve();
+  return async <T>(operation: () => Promise<T>): Promise<T> => {
+    const previous = tail;
+    let release!: () => void;
+    tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   };
 }
 
@@ -309,6 +328,117 @@ describe("retention coordinator", () => {
     expect(log).not.toContain("archive.put");
     expect(client.objects.size).toBe(0);
     expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([replayed.disposition]);
+  });
+
+  test("serializes concurrent epochs so no stale run can PUT after the winner disposes", async () => {
+    const log: string[] = [];
+    const store = await seedStore();
+    const client = createClient(log);
+    const base = await runOptions(store, client);
+    const withEpochLease = createEpochLeaseRunner();
+    let winnerEnteredSeal!: () => void;
+    const winnerAtSeal = new Promise<void>((resolve) => {
+      winnerEnteredSeal = resolve;
+    });
+    let releaseWinnerSeal!: () => void;
+    const winnerMaySeal = new Promise<void>((resolve) => {
+      releaseWinnerSeal = resolve;
+    });
+    let winnerFinished!: () => void;
+    const winnerDone = new Promise<void>((resolve) => {
+      winnerFinished = resolve;
+    });
+    let staleSealCalls = 0;
+    const winnerArchive = {
+      ...base.archive,
+      async sealEpoch(input: Parameters<typeof base.archive.sealEpoch>[0]) {
+        winnerEnteredSeal();
+        await winnerMaySeal;
+        return base.archive.sealEpoch(input);
+      },
+    };
+    const staleArchive = {
+      ...base.archive,
+      async sealEpoch(input: Parameters<typeof base.archive.sealEpoch>[0]) {
+        staleSealCalls += 1;
+        await winnerDone;
+        return base.archive.sealEpoch(input);
+      },
+    };
+
+    const winnerPromise = runRetentionEpoch({ ...base, archive: winnerArchive, withEpochLease });
+    await winnerAtSeal;
+    const stalePromise = runRetentionEpoch({ ...base, archive: staleArchive, withEpochLease });
+    await Promise.resolve();
+    releaseWinnerSeal();
+    const winner = await winnerPromise;
+    const logAtWinnerDisposal = log.length;
+    winnerFinished();
+    const stale = await stalePromise;
+
+    expect(stale.disposition).toEqual(winner.disposition);
+    expect(staleSealCalls).toBe(0);
+    expect(log.slice(logAtWinnerDisposal)).not.toContain("archive.put");
+    expect(client.objects.size).toBe(0);
+  });
+
+  test("a rejected epoch lease performs zero store and provider I/O", async () => {
+    const providerLog: string[] = [];
+    const storeLog: string[] = [];
+    const realStore = await seedStore();
+    const client = createClient(providerLog);
+    const base = await runOptions(realStore, client);
+    const observedStore: CheckpointingAuditStore = {
+      async append(...args) {
+        storeLog.push("append");
+        return realStore.append(...args);
+      },
+      async list(...args) {
+        storeLog.push("list");
+        return realStore.list(...args);
+      },
+      async getChainState(...args) {
+        storeLog.push("getChainState");
+        return realStore.getChainState(...args);
+      },
+      async advanceRetentionPolicyFence(...args) {
+        storeLog.push("advanceRetentionPolicyFence");
+        return realStore.advanceRetentionPolicyFence(...args);
+      },
+      async compactRange(...args) {
+        storeLog.push("compactRange");
+        return realStore.compactRange(...args);
+      },
+      async listCheckpoints(...args) {
+        storeLog.push("listCheckpoints");
+        return realStore.listCheckpoints(...args);
+      },
+      async prepareDisposition(...args) {
+        storeLog.push("prepareDisposition");
+        return realStore.prepareDisposition(...args);
+      },
+      async confirmDisposition(...args) {
+        storeLog.push("confirmDisposition");
+        return realStore.confirmDisposition(...args);
+      },
+      async listDispositions(...args) {
+        storeLog.push("listDispositions");
+        return realStore.listDispositions(...args);
+      },
+    };
+    providerLog.length = 0;
+
+    await expect(runRetentionEpoch({
+      ...base,
+      store: observedStore,
+      withEpochLease: async () => {
+        throw new Error("epoch lease unavailable");
+      },
+    })).rejects.toThrow("epoch lease unavailable");
+
+    expect(storeLog).toEqual([]);
+    expect(providerLog).toEqual([]);
+    expect(await realStore.listCheckpoints({ tenantId: TENANT_ID })).toEqual([]);
   });
 
   test("a fresh-fence retry supersedes a pending crashed deletion attempt and accepts no stale receipt", async () => {
