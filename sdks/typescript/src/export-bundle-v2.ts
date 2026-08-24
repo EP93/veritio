@@ -739,7 +739,9 @@ function verifyV2Shape(bundle: unknown, issues: string[]): bundle is ExportBundl
     fileKeys.some((path) => typeof files[path] !== "string")
   )
     valid = false;
-  const verificationEntry = manifest.files.find((entry) => entry.path === "verification.json");
+  const verificationEntry = Array.isArray(manifest.files)
+    ? manifest.files.find((entry) => isPlainObject(entry) && entry.path === "verification.json")
+    : undefined;
   if (verificationEntry?.records !== 0) valid = false;
   if (Boolean(bundle.signature) !== Boolean(manifest.signaturePublicKeyFingerprint)) valid = false;
   if (

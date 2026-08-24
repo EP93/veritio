@@ -91,6 +91,20 @@ describe("vevb-2 checkpoint-aware export", () => {
     }
   });
 
+  test("malformed descriptor arrays return sanitized invalid results without throwing", async () => {
+    const data = await fixture("export-bundle-v2-golden.json");
+    const base = data.bundle as ExportBundleV2;
+    for (const files of [null, [null], [{}]]) {
+      const malformed = clone(base) as any;
+      malformed.manifest.files = files;
+      const report = await verifyExportBundle(malformed);
+      expect(report.valid).toBe(false);
+      expect(report.checks.structure).toBe(false);
+      expect(report.issues).toEqual(["vevb-2 structure or chain claims are invalid"]);
+      expect(() => parseExportBundle(JSON.stringify(malformed))).toThrow("export bundle: invalid vevb-2 container");
+    }
+  });
+
   test("rejects open or incomplete audit and edge envelopes and nested protocol records after hashes are rebound", async () => {
     const data = await fixture("export-bundle-v2-golden.json");
     const base = data.bundle as ExportBundleV2;
@@ -165,7 +179,13 @@ describe("vevb-2 checkpoint-aware export", () => {
   test("uses one exact UTC-millisecond calendar timestamp contract in schema and runtime", async () => {
     const data = await fixture("export-bundle-v2-golden.json");
     const base = data.bundle as ExportBundleV2;
-    const invalid = ["2026-08-24", "2026-02-30T00:00:00.000Z", "2026-08-24T00:00:00Z", "2026-08-24T07:00:00.000+07:00"];
+    const invalid = [
+      "0000-02-29T00:00:00.000Z",
+      "2026-08-24",
+      "2026-02-30T00:00:00.000Z",
+      "2026-08-24T00:00:00Z",
+      "2026-08-24T07:00:00.000+07:00",
+    ];
     for (const createdAt of invalid) {
       const bundle = clone(base);
       bundle.manifest.createdAt = createdAt;
