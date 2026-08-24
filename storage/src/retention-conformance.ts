@@ -72,6 +72,44 @@ export function createRetentionStoreConformanceTests(
       },
     },
     {
+      name: "supports partial crops through a second ordered epoch",
+      async run() {
+        await withTarget(options, async ({ store }) => {
+          const first = await store.append(makeEvent("evt_retention_01", 1));
+          const second = await store.append(makeEvent("evt_retention_02", 2));
+          const third = await store.append(makeEvent("evt_retention_03", 3));
+          const fourth = await store.append(makeEvent("evt_retention_04", 4));
+          const firstCheckpoint = checkpointFor([first, second]);
+          const initial = await store.getChainState(SCOPE);
+
+          await store.compactRange(SCOPE, firstCheckpoint, initial, initial.retentionPolicyFence);
+
+          assert.deepEqual(await store.list(SCOPE), [third, fourth]);
+          const secondCheckpoint = checkpointFor([third], {
+            checkpointId: "rcp_retention_conformance_2",
+            epoch: 2,
+            previousCheckpointHash: firstCheckpoint.hash,
+            createdAt: "2026-08-24T01:01:00.000Z",
+          });
+          const afterFirstCrop = await store.getChainState(SCOPE);
+          await store.compactRange(SCOPE, secondCheckpoint, afterFirstCrop, afterFirstCrop.retentionPolicyFence);
+
+          assert.deepEqual(await store.list(SCOPE), [fourth]);
+          const secondAttempt = dispositionAttempt(secondCheckpoint, "attempt_epoch_2", 0);
+          await store.prepareDisposition(SCOPE, secondCheckpoint.hash, secondAttempt, 0);
+          const secondReceipt = dispositionFor(secondCheckpoint, "disposition_epoch_2", "policy.v2");
+          await store.confirmDisposition(SCOPE, secondReceipt, secondAttempt.attemptId, 0);
+          const firstAttempt = dispositionAttempt(firstCheckpoint, "attempt_epoch_1", 0);
+          await store.prepareDisposition(SCOPE, firstCheckpoint.hash, firstAttempt, 0);
+          const firstReceipt = dispositionFor(firstCheckpoint, "disposition_epoch_1", "policy.v1");
+          await store.confirmDisposition(SCOPE, firstReceipt, firstAttempt.attemptId, 0);
+
+          assert.deepEqual(await store.listCheckpoints(SCOPE), [firstCheckpoint, secondCheckpoint]);
+          assert.deepEqual(await store.listDispositions(SCOPE), [firstReceipt, secondReceipt]);
+        });
+      },
+    },
+    {
       name: "rejects stale state and wrong crop boundaries without partial mutation",
       async run() {
         await withTarget(options, async ({ store }) => {
@@ -239,25 +277,33 @@ function makeEvent(id: string, minute: number, role = "viewer"): AuditEvent {
 /**
  * Builds one canonical checkpoint over an exact contiguous record prefix.
  */
-function checkpointFor(records: readonly AuditRecord[]): RetentionCheckpoint {
+function checkpointFor(
+  records: readonly AuditRecord[],
+  options: {
+    checkpointId?: string;
+    epoch?: number;
+    previousCheckpointHash?: string | null;
+    createdAt?: string;
+  } = {},
+): RetentionCheckpoint {
   const first = records[0];
   const last = records.at(-1);
   if (!first || !last) {
     throw new TypeError("retention conformance checkpoint requires records");
   }
   return createRetentionCheckpoint({
-    checkpointId: "rcp_retention_conformance_1",
+    checkpointId: options.checkpointId ?? "rcp_retention_conformance_1",
     tenantId: TENANT_ID,
     chainKind: "audit",
-    epoch: 1,
+    epoch: options.epoch ?? 1,
     fromSequence: first.sequence,
     fromPreviousHash: first.previousHash,
     throughSequence: last.sequence,
     throughHash: last.hash,
     recordCount: records.length,
     archiveRootHash: ARCHIVE_ROOT_HASH,
-    previousCheckpointHash: null,
-    createdAt: "2026-08-24T01:00:00.000Z",
+    previousCheckpointHash: options.previousCheckpointHash ?? null,
+    createdAt: options.createdAt ?? "2026-08-24T01:00:00.000Z",
   });
 }
 

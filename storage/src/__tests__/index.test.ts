@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { type AuditRecord, createAuditEvent, MemoryAuditStore } from "@veritio/core";
+import {
+  type AuditRecord,
+  canonicalJson,
+  createAuditEvent,
+  createRetentionCheckpoint,
+  createRetentionDisposition,
+  type DispositionAttempt,
+  MemoryAuditStore,
+} from "@veritio/core";
 import { type AuditStoreConformanceCorruption, createAuditStoreConformanceTests } from "../conformance";
+import * as storageModule from "../index";
 import {
   createMariaDbAuditStore,
   createMongoAuditStore,
@@ -8,10 +17,12 @@ import {
   createNeonAuditStore,
   createPostgresAuditStore,
   createRedisAuditTipCache,
+  getSqlAuditRetentionTableNames,
   MONGO_RETENTION_INDEXES,
   type MongoAuditChainStateDocument,
   type MongoAuditCollection,
   type MongoAuditDocument,
+  type MongoAuditStoreOptions,
   type MongoCheckpointDocument,
   type MongoDispositionAttemptDocument,
   type MongoDispositionDocument,
@@ -89,20 +100,105 @@ describe("SQL AuditStore adapters", () => {
     expect(client.statements.some((statement) => statement.includes("LIMIT 1"))).toBe(true);
   });
 
-  test("SQL companion identifiers remain within the PostgreSQL and MariaDB identifier ceiling", async () => {
-    const client = createSqlClient();
-    const store = createMariaDbAuditStore({
-      client,
-      tableName: "veritio_mariadb_retention_records_1787565429246_185537",
+  test("SQL maps every schema and table identifier component within its dialect byte ceiling", async () => {
+    const longSchema = `schema_${"s".repeat(80)}`;
+    const longTable = `records_${"r".repeat(80)}`;
+    const postgresClient = createSqlClient();
+    const postgresStore = createPostgresAuditStore({
+      client: postgresClient,
+      tableName: `${longSchema}.${longTable}`,
     });
-    await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
-    await store.listCheckpoints({ tenantId: "org_123" });
+    await postgresStore.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    await postgresStore.listCheckpoints({ tenantId: "org_123" });
+    const postgresIdentifiers = postgresClient.statements.flatMap((statement) =>
+      [...statement.matchAll(/"([^"]+)"/g)].map((match) => match[1]!),
+    );
 
-    const identifiers = client.statements.flatMap((statement) =>
+    const mysqlClient = createSqlClient();
+    const mysqlStore = createMariaDbAuditStore({ client: mysqlClient, tableName: `${longSchema}.${longTable}` });
+    await mysqlStore.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    await mysqlStore.listCheckpoints({ tenantId: "org_123" });
+    const mysqlIdentifiers = mysqlClient.statements.flatMap((statement) =>
       [...statement.matchAll(/`([^`]+)`/g)].map((match) => match[1]!),
     );
-    expect(identifiers.length).toBeGreaterThan(0);
-    expect(identifiers.every((identifier) => identifier.length <= 63)).toBe(true);
+
+    expect(postgresIdentifiers.length).toBeGreaterThan(0);
+    expect(postgresIdentifiers.every((identifier) => Buffer.byteLength(identifier) <= 63)).toBe(true);
+    expect(mysqlIdentifiers.length).toBeGreaterThan(0);
+    expect(mysqlIdentifiers.every((identifier) => Buffer.byteLength(identifier) <= 64)).toBe(true);
+    expect(new Set(postgresIdentifiers).size).toBeGreaterThanOrEqual(5);
+    expect(new Set(mysqlIdentifiers).size).toBeGreaterThanOrEqual(5);
+  });
+
+  test("SQL identifier mapping is deterministic and honors the MySQL-only sixty-fourth byte", () => {
+    const identifier = `t${"x".repeat(63)}`;
+    const postgres = getSqlAuditRetentionTableNames(identifier, "postgres");
+    const postgresReplay = getSqlAuditRetentionTableNames(identifier, "postgres");
+    const mysql = getSqlAuditRetentionTableNames(identifier, "mysql");
+
+    expect(postgres).toEqual(postgresReplay);
+    expect(postgres.records).not.toBe(identifier);
+    expect(Buffer.byteLength(postgres.records)).toBeLessThanOrEqual(63);
+    expect(mysql.records).toBe(identifier);
+    expect(Buffer.byteLength(mysql.records)).toBe(64);
+  });
+
+  test("SQL compaction rejects redundant event canonical bytes that disagree with the verified record", async () => {
+    const client = createSqlClient();
+    const store = createPostgresAuditStore({ client });
+    const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    client.rows[0]!.event_canonical = canonicalJson({ ...record.event, metadata: { role: "tampered" } });
+    const state = await store.getChainState({ tenantId: "org_123" });
+
+    await expect(
+      store.compactRange({ tenantId: "org_123" }, checkpointForRecord(record), state, state.retentionPolicyFence),
+    ).rejects.toThrow("stored audit event canonical integrity check failed");
+
+    expect(await store.list({ tenantId: "org_123" })).toEqual([record]);
+    expect(await store.listCheckpoints({ tenantId: "org_123" })).toEqual([]);
+  });
+
+  test("SQL checkpoint reads reject redundant epoch and hash column corruption", async () => {
+    const client = createSqlClient();
+    const store = createPostgresAuditStore({ client });
+    const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    const checkpoint = checkpointForRecord(record);
+    const state = await store.getChainState({ tenantId: "org_123" });
+    await store.compactRange({ tenantId: "org_123" }, checkpoint, state, state.retentionPolicyFence);
+    const rows = (
+      client as typeof client & {
+        checkpoints: Array<{ epoch: number; checkpoint_hash: string }>;
+      }
+    ).checkpoints;
+    rows[0]!.epoch = 99;
+    rows[0]!.checkpoint_hash = "f".repeat(64);
+
+    await expect(store.listCheckpoints({ tenantId: "org_123" })).rejects.toThrow(
+      "stored retention checkpoint redundant column mismatch",
+    );
+  });
+
+  test("SQL disposition reads reject redundant checkpoint hash column corruption", async () => {
+    const client = createSqlClient();
+    const store = createPostgresAuditStore({ client });
+    const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    const checkpoint = checkpointForRecord(record);
+    const state = await store.getChainState({ tenantId: "org_123" });
+    await store.compactRange({ tenantId: "org_123" }, checkpoint, state, state.retentionPolicyFence);
+    const attempt = attemptForCheckpoint(checkpoint.hash);
+    await store.prepareDisposition({ tenantId: "org_123" }, checkpoint.hash, attempt, 0);
+    const receipt = dispositionForCheckpoint(checkpoint);
+    await store.confirmDisposition({ tenantId: "org_123" }, receipt, attempt.attemptId, 0);
+    const rows = (
+      client as typeof client & {
+        dispositions: Array<{ checkpoint_hash: string }>;
+      }
+    ).dispositions;
+    rows[0]!.checkpoint_hash = "f".repeat(64);
+
+    await expect(store.listDispositions({ tenantId: "org_123" })).rejects.toThrow(
+      "stored retention disposition redundant column mismatch",
+    );
   });
 });
 
@@ -144,6 +240,139 @@ describe("Mongo AuditStore adapter", () => {
     })) {
       test(conformanceTest.name, conformanceTest.run);
     }
+  });
+
+  test("Mongo compaction rejects redundant event canonical bytes that disagree with the verified record", async () => {
+    const collection = createMongoCollection();
+    const retention = createMongoRetentionCollections();
+    const store = createMongoAuditStore({
+      collection,
+      retention,
+      transaction: async (run) => run({ collection }),
+    });
+    const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    collection.documents[0]!.eventCanonical = canonicalJson({ ...record.event, metadata: { role: "tampered" } });
+    const state = await store.getChainState({ tenantId: "org_123" });
+
+    await expect(
+      store.compactRange({ tenantId: "org_123" }, checkpointForRecord(record), state, state.retentionPolicyFence),
+    ).rejects.toThrow("stored audit event canonical integrity check failed");
+
+    expect(await store.list({ tenantId: "org_123" })).toEqual([record]);
+    expect(await store.listCheckpoints({ tenantId: "org_123" })).toEqual([]);
+  });
+
+  test("Mongo checkpoint reads reject redundant epoch and hash field corruption", async () => {
+    const collection = createMongoCollection();
+    const retention = createMongoRetentionCollections();
+    const store = createMongoAuditStore({
+      collection,
+      retention,
+      transaction: async (run) => run({ collection }),
+    });
+    const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    const checkpoint = checkpointForRecord(record);
+    const state = await store.getChainState({ tenantId: "org_123" });
+    await store.compactRange({ tenantId: "org_123" }, checkpoint, state, state.retentionPolicyFence);
+    const documents = retentionDocuments(retention.checkpoints);
+    documents[0]!.epoch = 99;
+    documents[0]!.checkpointHash = "f".repeat(64);
+
+    await expect(store.listCheckpoints({ tenantId: "org_123" })).rejects.toThrow(
+      "stored retention checkpoint redundant column mismatch",
+    );
+  });
+
+  test("Mongo disposition reads reject redundant checkpoint hash field corruption", async () => {
+    const collection = createMongoCollection();
+    const retention = createMongoRetentionCollections();
+    const store = createMongoAuditStore({
+      collection,
+      retention,
+      transaction: async (run) => run({ collection }),
+    });
+    const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    const checkpoint = checkpointForRecord(record);
+    const state = await store.getChainState({ tenantId: "org_123" });
+    await store.compactRange({ tenantId: "org_123" }, checkpoint, state, state.retentionPolicyFence);
+    const attempt = attemptForCheckpoint(checkpoint.hash);
+    await store.prepareDisposition({ tenantId: "org_123" }, checkpoint.hash, attempt, 0);
+    const receipt = dispositionForCheckpoint(checkpoint);
+    await store.confirmDisposition({ tenantId: "org_123" }, receipt, attempt.attemptId, 0);
+    retentionDocuments(retention.dispositions)[0]!.checkpointHash = "f".repeat(64);
+
+    await expect(store.listDispositions({ tenantId: "org_123" })).rejects.toThrow(
+      "stored retention disposition redundant column mismatch",
+    );
+  });
+
+  test("Mongo retention activation requires an explicit integrity-validating legacy backfill", async () => {
+    const collection = createMongoCollection();
+    const transaction: MongoAuditStoreOptions["transaction"] = async (run) => run({ collection });
+    const legacyStore = createMongoAuditStore({ collection, transaction });
+    const firstEvent = makeEvent("evt_01", "org_123", { role: "viewer" });
+    const first = await legacyStore.append(firstEvent);
+    const second = await legacyStore.append(makeEvent("evt_02", "org_123", { role: "admin" }));
+    const retention = createMongoRetentionCollections();
+    const store = createMongoAuditStore({ collection, retention, transaction });
+
+    await expect(store.getChainState({ tenantId: "org_123" })).rejects.toThrow(
+      "Mongo retention state migration required",
+    );
+    await expect(store.append(makeEvent("evt_03", "org_123", { role: "owner" }))).rejects.toThrow(
+      "Mongo retention state migration required",
+    );
+
+    const backfill = (
+      storageModule as typeof storageModule & {
+        backfillMongoAuditRetentionState(
+          options: MongoAuditStoreOptions,
+          scope: { tenantId: string },
+        ): Promise<unknown>;
+      }
+    ).backfillMongoAuditRetentionState;
+    expect(backfill).toBeFunction();
+    await backfill({ collection, retention, transaction }, { tenantId: "org_123" });
+
+    expect(await store.getChainState({ tenantId: "org_123" })).toEqual({
+      authoritativeTipSequence: 2,
+      authoritativeTipHash: second.hash,
+      minimumRetainedSequence: 1,
+      latestCheckpointHash: null,
+      retentionPolicyFence: 0,
+    });
+    expect(await store.append(firstEvent)).toEqual(first);
+    const third = await store.append(makeEvent("evt_03", "org_123", { role: "owner" }));
+    expect(third.sequence).toBe(3);
+    expect(third.previousHash).toBe(second.hash);
+  });
+
+  test("Mongo legacy backfill rejects a corrupt chain without partial activation", async () => {
+    const collection = createMongoCollection();
+    const transaction: MongoAuditStoreOptions["transaction"] = async (run) => run({ collection });
+    const legacyStore = createMongoAuditStore({ collection, transaction });
+    await legacyStore.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+    await legacyStore.append(makeEvent("evt_02", "org_123", { role: "admin" }));
+    const second = JSON.parse(collection.documents[1]!.recordJson) as AuditRecord;
+    collection.documents[1]!.recordJson = JSON.stringify({ ...second, previousHash: "f".repeat(64) });
+    const retention = createMongoRetentionCollections();
+    const store = createMongoAuditStore({ collection, retention, transaction });
+    const backfill = (
+      storageModule as typeof storageModule & {
+        backfillMongoAuditRetentionState(
+          options: MongoAuditStoreOptions,
+          scope: { tenantId: string },
+        ): Promise<unknown>;
+      }
+    ).backfillMongoAuditRetentionState;
+
+    expect(backfill).toBeFunction();
+    await expect(backfill({ collection, retention, transaction }, { tenantId: "org_123" })).rejects.toThrow(
+      "stored audit record integrity check failed",
+    );
+    await expect(store.getChainState({ tenantId: "org_123" })).rejects.toThrow(
+      "Mongo retention state migration required",
+    );
   });
 });
 
@@ -188,6 +417,44 @@ function makeEvent(id: string, tenantId: string, metadata: Record<string, unknow
     target: { type: "organization", id: tenantId },
     scope: { tenantId, environment: "test" },
     metadata,
+  });
+}
+
+/** Builds one deterministic single-record checkpoint for focused adapter regressions. */
+function checkpointForRecord(record: AuditRecord) {
+  return createRetentionCheckpoint({
+    checkpointId: `rcp_${record.event.id}`,
+    tenantId: record.event.scope!.tenantId!,
+    chainKind: "audit",
+    epoch: 1,
+    fromSequence: record.sequence,
+    fromPreviousHash: record.previousHash,
+    throughSequence: record.sequence,
+    throughHash: record.hash,
+    recordCount: 1,
+    archiveRootHash: "a".repeat(64),
+    previousCheckpointHash: null,
+    createdAt: "2026-08-24T01:00:00.000Z",
+  });
+}
+
+/** Builds the minimal pending attempt used by redundant receipt-column regressions. */
+function attemptForCheckpoint(checkpointHash: string): DispositionAttempt {
+  return { attemptId: "attempt_integrity", checkpointHash, policyFence: 0, status: "pending" };
+}
+
+/** Builds one deterministic receipt matching a focused single-record checkpoint. */
+function dispositionForCheckpoint(checkpoint: ReturnType<typeof checkpointForRecord>) {
+  return createRetentionDisposition({
+    dispositionId: "disposition_integrity",
+    tenantId: checkpoint.tenantId,
+    chainKind: "audit",
+    checkpointHash: checkpoint.hash,
+    fromSequence: checkpoint.fromSequence,
+    throughSequence: checkpoint.throughSequence,
+    archiveRootHash: checkpoint.archiveRootHash,
+    policyReference: "policy.integrity",
+    disposedAt: "2026-08-24T02:00:00.000Z",
   });
 }
 
@@ -321,7 +588,7 @@ function createSqlClient(): SqlAuditExecutor & { rows: SqlAuditRow[]; statements
         else client.ledger.push(next);
         return [];
       }
-      if (sql.startsWith("select checkpoint_canonical") && sql.includes("_checkpoints")) {
+      if (sql.startsWith("select") && sql.includes("checkpoint_canonical") && sql.includes("_checkpoints")) {
         const [tenantId, checkpointHash] = params;
         let rows = client.checkpoints.filter(
           (row) =>
@@ -377,10 +644,11 @@ function createSqlClient(): SqlAuditExecutor & { rows: SqlAuditRow[]; statements
         });
         return [];
       }
-      if (sql.startsWith("select disposition_canonical") && sql.includes("_receipts")) {
+      if (sql.startsWith("select") && sql.includes("disposition_canonical") && sql.includes("_receipts")) {
         const [tenantId, checkpointHash] = params;
         return client.dispositions.filter(
-          (row) => row.tenant_id === tenantId && row.checkpoint_hash === checkpointHash,
+          (row) =>
+            row.tenant_id === tenantId && (checkpointHash === undefined || row.checkpoint_hash === checkpointHash),
         );
       }
       if (sql.startsWith("insert") && sql.includes("_receipts")) {
@@ -544,9 +812,10 @@ function createMongoRetentionCollections(): MongoRetentionCollections {
 
 function createMongoRetentionCollection<
   TDocument extends Record<string, unknown>,
->(): MongoRetentionCollection<TDocument> {
+>(): MongoRetentionCollection<TDocument> & { documents: TDocument[] } {
   const documents: TDocument[] = [];
   return {
+    documents,
     async findOne(filter, options = {}) {
       const matches = documents.filter((document) => matchesGenericMongoFilter(document, filter));
       sortGenericMongoDocuments(matches, options.sort);
@@ -577,6 +846,17 @@ function createMongoRetentionCollection<
       if (set) Object.assign(document, set);
       const unset = update.$unset as Record<string, unknown> | undefined;
       if (unset) for (const key of Object.keys(unset)) delete document[key];
+      const increment = update.$inc as Record<string, unknown> | undefined;
+      if (increment) {
+        for (const [key, value] of Object.entries(increment)) {
+          if (typeof value !== "number") throw new TypeError("fake Mongo increment must be numeric");
+          const current = document[key];
+          if (current !== undefined && typeof current !== "number") {
+            throw new TypeError("fake Mongo increment target must be numeric");
+          }
+          document[key] = (current ?? 0) + value;
+        }
+      }
       return { acknowledged: true, matchedCount: 1 };
     },
     async deleteMany(filter) {
@@ -586,6 +866,13 @@ function createMongoRetentionCollection<
       return { acknowledged: true };
     },
   };
+}
+
+/** Exposes the unit fake's backing documents for deliberate integrity corruption. */
+function retentionDocuments<TDocument extends Record<string, unknown>>(
+  collection: MongoRetentionCollection<TDocument>,
+): TDocument[] {
+  return (collection as MongoRetentionCollection<TDocument> & { documents: TDocument[] }).documents;
 }
 
 function matchesGenericMongoFilter(document: Record<string, unknown>, filter: Record<string, unknown>): boolean {
@@ -616,8 +903,14 @@ function matchesMongoFilter(document: MongoAuditDocument, filter: Record<string,
   if (filter.idempotencyKeyHash !== undefined && document.idempotencyKeyHash !== filter.idempotencyKeyHash) {
     return false;
   }
-  const sequence = filter.sequence as { $gt?: number } | undefined;
+  const sequence = filter.sequence as { $gt?: number; $gte?: number; $lte?: number } | undefined;
   if (sequence?.$gt !== undefined && document.sequence <= sequence.$gt) {
+    return false;
+  }
+  if (sequence?.$gte !== undefined && document.sequence < sequence.$gte) {
+    return false;
+  }
+  if (sequence?.$lte !== undefined && document.sequence > sequence.$lte) {
     return false;
   }
   return true;

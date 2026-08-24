@@ -249,14 +249,21 @@ export interface SqlAuditRetentionTableNames {
  * Derives deterministic additive companion names while keeping each identifier
  * within PostgreSQL's 63-byte and MySQL/MariaDB's 64-byte ASCII ceilings.
  */
-export function getSqlAuditRetentionTableNames(tableName: string): SqlAuditRetentionTableNames {
+export function getSqlAuditRetentionTableNames(
+  tableName: string,
+  dialect: SqlDialect = "postgres",
+): SqlAuditRetentionTableNames {
+  const limit = sqlIdentifierByteLimit(dialect);
+  const records = splitSqlTableName(tableName)
+    .map((part) => boundSqlIdentifier(part, limit))
+    .join(".");
   return {
-    records: tableName,
-    chainState: appendTableSuffix(tableName, "_state"),
-    idempotencyLedger: appendTableSuffix(tableName, "_idem"),
-    checkpoints: appendTableSuffix(tableName, "_checkpoints"),
-    dispositionAttempts: appendTableSuffix(tableName, "_attempts"),
-    dispositions: appendTableSuffix(tableName, "_receipts"),
+    records,
+    chainState: appendTableSuffix(records, "_state", limit),
+    idempotencyLedger: appendTableSuffix(records, "_idem", limit),
+    checkpoints: appendTableSuffix(records, "_checkpoints", limit),
+    dispositionAttempts: appendTableSuffix(records, "_attempts", limit),
+    dispositions: appendTableSuffix(records, "_receipts", limit),
   };
 }
 
@@ -384,7 +391,7 @@ export interface RedisAuditTipCache {
   setTenantTip(record: AuditRecord, options?: { ttlSeconds?: number }): Promise<void>;
 }
 
-type SqlDialect = "postgres" | "mysql";
+export type SqlDialect = "postgres" | "mysql";
 
 const DEFAULT_SQL_TABLE = "veritio_audit_records";
 const DEFAULT_REDIS_TIP_PREFIX = "veritio:audit-tip";
@@ -440,6 +447,46 @@ export function createMariaDBAuditStore(options: SqlAuditStoreOptions): Checkpoi
  */
 export function createMongoAuditStore(options: MongoAuditStoreOptions): CheckpointingAuditStore {
   return new MongoAuditStore(options);
+}
+
+/**
+ * Explicitly activates retention for one legacy Mongo tenant by validating the
+ * complete hot chain and atomically backfilling authoritative state and ledger.
+ */
+export async function backfillMongoAuditRetentionState(
+  options: MongoAuditStoreOptions,
+  scope: EvidenceScope & { tenantId: string },
+): Promise<AuditChainState> {
+  const tenantId = requireNonEmptyString(scope.tenantId, "scope.tenantId");
+  const retention = options.retention;
+  if (!retention) throw new TypeError("Mongo retention collections are required");
+  return options.transaction(async (context) => {
+    const operationOptions = context.options ?? {};
+    const existing = await retention.chainStates.findOne({ tenantId }, withMongoOptions(operationOptions));
+    if (existing) return chainStateFromMongoDocument(existing, tenantId);
+    const collection = context.collection ?? options.collection;
+    const documents = await collection
+      .find({ tenantId }, withMongoOptions(operationOptions, { sort: { sequence: 1 } }))
+      .toArray();
+    const records = documents.map((document) => verifiedMongoAuditDocumentRecord(document, tenantId));
+    assertLegacyMongoAuditChain(records);
+    for (const record of records) {
+      await retention.idempotencyLedger.insertOne(
+        mongoLedgerDocument(tenantId, record.idempotencyKeyHash, sha256Hex(canonicalJson(record.event)), record),
+        operationOptions,
+      );
+    }
+    const tip = records.at(-1);
+    const state: AuditChainState = {
+      authoritativeTipSequence: tip?.sequence ?? 0,
+      authoritativeTipHash: tip?.hash ?? null,
+      minimumRetainedSequence: 1,
+      latestCheckpointHash: null,
+      retentionPolicyFence: 0,
+    };
+    await retention.chainStates.insertOne(mongoChainStateDocument(tenantId, state), operationOptions);
+    return { ...state };
+  });
 }
 
 /**
@@ -500,7 +547,7 @@ class SqlAuditStore implements CheckpointingAuditStore {
     this.#dialect = dialect;
     this.#client = options.client;
     const tableName = options.tableName ?? DEFAULT_SQL_TABLE;
-    const names = getSqlAuditRetentionTableNames(tableName);
+    const names = getSqlAuditRetentionTableNames(tableName, dialect);
     this.#table = quoteTableName(names.records, dialect);
     this.#chainStateTable = quoteTableName(names.chainState, dialect);
     this.#idempotencyTable = quoteTableName(names.idempotencyLedger, dialect);
@@ -678,10 +725,12 @@ class SqlAuditStore implements CheckpointingAuditStore {
     await this.#client.transaction(async (session) => {
       const current = await this.#lockChainState(session, tenantId);
       assertCompactionEnvelope(tenantId, checkpoint, expected, policyFence, current);
-      const previousRow = firstRow(
+      const previousCheckpoints = rowsFromResult(
         await session.execute(this.#selectLatestCheckpointSql(true), this.#params(tenantId)),
-      );
-      const previousCheckpoint = previousRow ? checkpointFromSqlRow(previousRow, tenantId) : undefined;
+      )
+        .map((row) => checkpointFromSqlRow(row, tenantId))
+        .sort((left, right) => left.epoch - right.epoch);
+      const previousCheckpoint = previousCheckpoints.at(-1);
       assertCheckpointPrefix(checkpoint, current, previousCheckpoint);
 
       const rows = rowsFromResult(
@@ -694,7 +743,7 @@ class SqlAuditStore implements CheckpointingAuditStore {
       assertCheckpointRecords(checkpoint, records);
 
       for (const [index, record] of records.entries()) {
-        const eventCanonical = readString(rows[index]!, "event_canonical");
+        const eventCanonical = verifiedStoredEventCanonical(record, readString(rows[index]!, "event_canonical"));
         await session.execute(
           this.#upsertTombstoneSql(),
           this.#params(tenantId, record.idempotencyKeyHash, sha256Hex(eventCanonical), record.sequence, record.hash),
@@ -722,7 +771,10 @@ class SqlAuditStore implements CheckpointingAuditStore {
   async listCheckpoints(scope: EvidenceScope & { tenantId: string }): Promise<RetentionCheckpoint[]> {
     const tenantId = requireNonEmptyString(scope.tenantId, "scope.tenantId");
     const rows = rowsFromResult(await this.#client.execute(this.#listCheckpointsSql(), this.#params(tenantId)));
-    return rows.map((row) => cloneRetentionCheckpoint(checkpointFromSqlRow(row, tenantId)));
+    return rows
+      .map((row) => checkpointFromSqlRow(row, tenantId))
+      .sort((left, right) => left.epoch - right.epoch)
+      .map(cloneRetentionCheckpoint);
   }
 
   /**
@@ -823,7 +875,7 @@ class SqlAuditStore implements CheckpointingAuditStore {
         await session.execute(this.#selectDispositionSql(), this.#params(tenantId, checkpointHash)),
       );
       if (existingRow) {
-        const existing = dispositionFromSqlRow(existingRow, checkpoint);
+        const existing = dispositionFromSqlRow(existingRow, checkpoint, tenantId);
         if (attempt.status === "disposed" && canonicalJson(existing) === canonicalJson(receipt)) return;
         throw new TypeError("conflicting disposition receipt");
       }
@@ -855,14 +907,16 @@ class SqlAuditStore implements CheckpointingAuditStore {
   async listDispositions(scope: EvidenceScope & { tenantId: string }): Promise<RetentionDisposition[]> {
     const tenantId = requireNonEmptyString(scope.tenantId, "scope.tenantId");
     const checkpoints = await this.listCheckpoints(scope);
-    const results: RetentionDisposition[] = [];
-    for (const checkpoint of checkpoints) {
-      const row = firstRow(
-        await this.#client.execute(this.#selectDispositionSql(), this.#params(tenantId, checkpoint.hash)),
-      );
-      if (row) results.push(cloneRetentionDisposition(dispositionFromSqlRow(row, checkpoint)));
-    }
-    return results;
+    const checkpointsByHash = new Map(checkpoints.map((checkpoint) => [checkpoint.hash, checkpoint]));
+    const rows = rowsFromResult(await this.#client.execute(this.#listDispositionsSql(), this.#params(tenantId)));
+    return rows
+      .map((row) => {
+        const checkpoint = checkpointsByHash.get(dispositionCheckpointHash(readString(row, "disposition_canonical")));
+        if (!checkpoint) throw new TypeError("stored retention disposition checkpoint not found");
+        return { checkpoint, disposition: dispositionFromSqlRow(row, checkpoint, tenantId) };
+      })
+      .sort((left, right) => left.checkpoint.epoch - right.checkpoint.epoch)
+      .map(({ disposition }) => cloneRetentionDisposition(disposition));
   }
 
   /**
@@ -945,17 +999,17 @@ class SqlAuditStore implements CheckpointingAuditStore {
 
   /** Selects the current checkpoint anchor, optionally locking it for crop. */
   #selectLatestCheckpointSql(lock: boolean): string {
-    return `SELECT checkpoint_canonical FROM ${this.#checkpointsTable} WHERE tenant_id = ${this.#placeholder(1)} ORDER BY epoch DESC LIMIT 1${lock ? " FOR UPDATE" : ""}`;
+    return `SELECT tenant_id, epoch, checkpoint_hash, checkpoint_canonical FROM ${this.#checkpointsTable} WHERE tenant_id = ${this.#placeholder(1)}${lock ? " FOR UPDATE" : ""}`;
   }
 
   /** Lists canonical checkpoints by authoritative epoch order. */
   #listCheckpointsSql(): string {
-    return `SELECT checkpoint_canonical FROM ${this.#checkpointsTable} WHERE tenant_id = ${this.#placeholder(1)} ORDER BY epoch ASC`;
+    return `SELECT tenant_id, epoch, checkpoint_hash, checkpoint_canonical FROM ${this.#checkpointsTable} WHERE tenant_id = ${this.#placeholder(1)}`;
   }
 
   /** Selects one tenant-scoped checkpoint by its protocol hash. */
   #selectCheckpointByHashSql(): string {
-    return `SELECT checkpoint_canonical FROM ${this.#checkpointsTable} WHERE tenant_id = ${this.#placeholder(1)} AND checkpoint_hash = ${this.#placeholder(2)} LIMIT 1`;
+    return `SELECT tenant_id, epoch, checkpoint_hash, checkpoint_canonical FROM ${this.#checkpointsTable} WHERE tenant_id = ${this.#placeholder(1)} AND checkpoint_hash = ${this.#placeholder(2)} LIMIT 1`;
   }
 
   /** Selects one disposition attempt with optional transactional locking. */
@@ -975,7 +1029,12 @@ class SqlAuditStore implements CheckpointingAuditStore {
 
   /** Selects the unique accepted disposition for one checkpoint. */
   #selectDispositionSql(): string {
-    return `SELECT disposition_canonical FROM ${this.#dispositionsTable} WHERE tenant_id = ${this.#placeholder(1)} AND checkpoint_hash = ${this.#placeholder(2)} LIMIT 1`;
+    return `SELECT tenant_id, checkpoint_hash, disposition_canonical FROM ${this.#dispositionsTable} WHERE tenant_id = ${this.#placeholder(1)} AND checkpoint_hash = ${this.#placeholder(2)} LIMIT 1`;
+  }
+
+  /** Lists every tenant receipt so canonical checkpoint epochs control ordering. */
+  #listDispositionsSql(): string {
+    return `SELECT tenant_id, checkpoint_hash, disposition_canonical FROM ${this.#dispositionsTable} WHERE tenant_id = ${this.#placeholder(1)}`;
   }
 
   /** Persists one accepted canonical receipt under checkpoint uniqueness. */
@@ -1188,7 +1247,11 @@ class MongoAuditStore implements CheckpointingAuditStore {
     const tenantId = requireNonEmptyString(scope.tenantId, "scope.tenantId");
     const retention = this.#requireRetention();
     const document = await retention.chainStates.findOne({ tenantId });
-    return document ? chainStateFromMongoDocument(document, tenantId) : genesisChainState();
+    if (document) return chainStateFromMongoDocument(document, tenantId);
+    if (await this.#collection.findOne({ tenantId })) {
+      throw new TypeError("Mongo retention state migration required");
+    }
+    return genesisChainState();
   }
 
   /** Locks Mongo chain state through the host replica-set transaction and CASes the policy fence. */
@@ -1233,11 +1296,12 @@ class MongoAuditStore implements CheckpointingAuditStore {
       const operationOptions = context.options ?? {};
       const current = await this.#mongoChainState(retention, tenantId, operationOptions);
       assertCompactionEnvelope(tenantId, checkpoint, expected, policyFence, current);
-      const previousDocument = await retention.checkpoints.findOne(
-        { tenantId },
-        withMongoOptions(operationOptions, { sort: { epoch: -1 } }),
-      );
-      const previousCheckpoint = previousDocument ? checkpointFromMongoDocument(previousDocument, tenantId) : undefined;
+      const previousCheckpoints = (
+        await retention.checkpoints.find({ tenantId }, withMongoOptions(operationOptions)).toArray()
+      )
+        .map((document) => checkpointFromMongoDocument(document, tenantId))
+        .sort((left, right) => left.epoch - right.epoch);
+      const previousCheckpoint = previousCheckpoints.at(-1);
       assertCheckpointPrefix(checkpoint, current, previousCheckpoint);
       const documents = await collection
         .find(
@@ -1248,7 +1312,7 @@ class MongoAuditStore implements CheckpointingAuditStore {
       const records = documents.map((document) => recordFromMongoDocument(document, tenantId));
       assertCheckpointRecords(checkpoint, records);
       for (const [index, record] of records.entries()) {
-        const eventCanonical = documents[index]!.eventCanonical;
+        const eventCanonical = verifiedStoredEventCanonical(record, documents[index]!.eventCanonical);
         await retention.idempotencyLedger.updateOne(
           { tenantId, idempotencyKeyHash: record.idempotencyKeyHash },
           {
@@ -1288,10 +1352,11 @@ class MongoAuditStore implements CheckpointingAuditStore {
   /** Lists cloned hash-verified Mongo checkpoint records in epoch order. */
   async listCheckpoints(scope: EvidenceScope & { tenantId: string }): Promise<RetentionCheckpoint[]> {
     const tenantId = requireNonEmptyString(scope.tenantId, "scope.tenantId");
-    const documents = await this.#requireRetention()
-      .checkpoints.find({ tenantId }, { sort: { epoch: 1 } })
-      .toArray();
-    return documents.map((document) => cloneRetentionCheckpoint(checkpointFromMongoDocument(document, tenantId)));
+    const documents = await this.#requireRetention().checkpoints.find({ tenantId }).toArray();
+    return documents
+      .map((document) => checkpointFromMongoDocument(document, tenantId))
+      .sort((left, right) => left.epoch - right.epoch)
+      .map(cloneRetentionCheckpoint);
   }
 
   /** Creates, replays, or fresh-fence rebinds one Mongo disposition attempt transactionally. */
@@ -1309,6 +1374,7 @@ class MongoAuditStore implements CheckpointingAuditStore {
       const operationOptions = context.options ?? {};
       const current = await this.#mongoChainState(retention, tenantId, operationOptions);
       assertAttemptFence(checkpointHash, attempt, expectedPolicyFence, current);
+      await this.#casMongoChainState(retention, tenantId, current, operationOptions);
       const checkpointDocument = await retention.checkpoints.findOne(
         { tenantId, checkpointHash },
         withMongoOptions(operationOptions),
@@ -1355,6 +1421,7 @@ class MongoAuditStore implements CheckpointingAuditStore {
       const operationOptions = context.options ?? {};
       const current = await this.#mongoChainState(retention, tenantId, operationOptions);
       if (current.retentionPolicyFence !== expectedPolicyFence) throw new TypeError("retention policy fence mismatch");
+      await this.#casMongoChainState(retention, tenantId, current, operationOptions);
       const checkpointHash = receipt.checkpointHash;
       const attemptDocument = await retention.dispositionAttempts.findOne(
         { tenantId, checkpointHash },
@@ -1376,7 +1443,7 @@ class MongoAuditStore implements CheckpointingAuditStore {
         withMongoOptions(operationOptions),
       );
       if (existingDocument) {
-        const existing = dispositionFromMongoDocument(existingDocument, checkpoint);
+        const existing = dispositionFromMongoDocument(existingDocument, checkpoint, tenantId);
         if (attempt.status === "disposed" && canonicalJson(existing) === canonicalJson(receipt)) return;
         throw new TypeError("conflicting disposition receipt");
       }
@@ -1400,12 +1467,16 @@ class MongoAuditStore implements CheckpointingAuditStore {
     const tenantId = requireNonEmptyString(scope.tenantId, "scope.tenantId");
     const retention = this.#requireRetention();
     const checkpoints = await this.listCheckpoints(scope);
-    const results: RetentionDisposition[] = [];
-    for (const checkpoint of checkpoints) {
-      const document = await retention.dispositions.findOne({ tenantId, checkpointHash: checkpoint.hash });
-      if (document) results.push(cloneRetentionDisposition(dispositionFromMongoDocument(document, checkpoint)));
-    }
-    return results;
+    const checkpointsByHash = new Map(checkpoints.map((checkpoint) => [checkpoint.hash, checkpoint]));
+    const documents = await retention.dispositions.find({ tenantId }).toArray();
+    return documents
+      .map((document) => {
+        const checkpoint = checkpointsByHash.get(dispositionCheckpointHash(document.dispositionCanonical));
+        if (!checkpoint) throw new TypeError("stored retention disposition checkpoint not found");
+        return { checkpoint, disposition: dispositionFromMongoDocument(document, checkpoint, tenantId) };
+      })
+      .sort((left, right) => left.checkpoint.epoch - right.checkpoint.epoch)
+      .map(({ disposition }) => cloneRetentionDisposition(disposition));
   }
 
   /** Fails closed when a host invokes destructive retention before injecting all companion collections. */
@@ -1423,12 +1494,33 @@ class MongoAuditStore implements CheckpointingAuditStore {
   ): Promise<AuditChainState> {
     let document = await retention.chainStates.findOne({ tenantId }, withMongoOptions(operationOptions));
     if (!document) {
+      if (await this.#collection.findOne({ tenantId }, withMongoOptions(operationOptions))) {
+        throw new TypeError("Mongo retention state migration required");
+      }
       const genesis = genesisChainState();
       await retention.chainStates.insertOne(mongoChainStateDocument(tenantId, genesis), operationOptions);
       document = await retention.chainStates.findOne({ tenantId }, withMongoOptions(operationOptions));
     }
     if (!document) throw new TypeError("failed to initialize audit chain state");
     return chainStateFromMongoDocument(document, tenantId);
+  }
+
+  /**
+   * Conditionally writes the complete state document so Mongo snapshot
+   * transactions conflict with any concurrent append, crop, or fence advance.
+   */
+  async #casMongoChainState(
+    retention: MongoRetentionCollections,
+    tenantId: string,
+    expected: AuditChainState,
+    operationOptions: Record<string, unknown>,
+  ): Promise<void> {
+    const result = await retention.chainStates.updateOne(
+      { tenantId, ...expected },
+      { $inc: { retentionCasRevision: 1 } },
+      operationOptions,
+    );
+    assertMongoUpdateMatched(result, "retention policy fence mismatch");
   }
 }
 
@@ -1443,16 +1535,28 @@ function genesisChainState(): AuditChainState {
   };
 }
 
-/** Appends a companion-table suffix to the final part of a validated SQL table name. */
-function appendTableSuffix(tableName: string, suffix: string): string {
+/** Appends a distinct companion suffix without exceeding the active dialect's byte ceiling. */
+function appendTableSuffix(tableName: string, suffix: string, limit: number): string {
   const parts = tableName.split(".");
   const finalPart = parts.pop();
   if (!finalPart) throw new TypeError("tableName must be an identifier or schema-qualified identifier");
   const candidate = `${finalPart}${suffix}`;
-  if (candidate.length <= 63) return [...parts, candidate].join(".");
+  if (Buffer.byteLength(candidate) <= limit) return [...parts, candidate].join(".");
   const digest = sha256Hex(`${finalPart}\u0000${suffix}`).slice(0, 8);
-  const prefixLength = 63 - suffix.length - digest.length - 1;
+  const prefixLength = limit - suffix.length - digest.length - 1;
   return [...parts, `${finalPart.slice(0, prefixLength)}_${digest}${suffix}`].join(".");
+}
+
+/** Returns the server-enforced byte ceiling for one SQL identifier component. */
+function sqlIdentifierByteLimit(dialect: SqlDialect): number {
+  return dialect === "postgres" ? 63 : 64;
+}
+
+/** Deterministically maps one valid overlong identifier into its dialect ceiling. */
+function boundSqlIdentifier(identifier: string, limit: number): string {
+  if (Buffer.byteLength(identifier) <= limit) return identifier;
+  const digest = sha256Hex(identifier).slice(0, 8);
+  return `${identifier.slice(0, limit - digest.length - 1)}_${digest}`;
 }
 
 /** Parses one SQL chain-state row and validates all numeric/hash boundaries. */
@@ -1569,15 +1673,42 @@ function assertCheckpointRecords(checkpoint: RetentionCheckpoint, records: reado
   }
 }
 
+/**
+ * Derives canonical event bytes from a hash-verified record and rejects any
+ * redundant storage column that disagrees before creating a permanent digest.
+ */
+function verifiedStoredEventCanonical(record: AuditRecord, redundantCanonical: unknown): string {
+  const canonical = canonicalJson(record.event);
+  if (redundantCanonical !== canonical) {
+    throw new TypeError("stored audit event canonical integrity check failed");
+  }
+  return canonical;
+}
+
 /** Parses and hash-verifies canonical checkpoint bytes stored by SQL. */
 function checkpointFromSqlRow(row: Record<string, unknown>, expectedTenantId: string): RetentionCheckpoint {
-  return parseStoredCheckpoint(readString(row, "checkpoint_canonical"), expectedTenantId);
+  const checkpoint = parseStoredCheckpoint(readString(row, "checkpoint_canonical"), expectedTenantId);
+  if (
+    readString(row, "tenant_id") !== checkpoint.tenantId ||
+    readSafeInteger(row, "epoch") !== checkpoint.epoch ||
+    readString(row, "checkpoint_hash") !== checkpoint.hash
+  ) {
+    throw new TypeError("stored retention checkpoint redundant column mismatch");
+  }
+  return checkpoint;
 }
 
 /** Parses and hash-verifies canonical checkpoint bytes stored by Mongo. */
 function checkpointFromMongoDocument(document: MongoCheckpointDocument, expectedTenantId: string): RetentionCheckpoint {
-  if (document.tenantId !== expectedTenantId) throw new TypeError("stored retention checkpoint tenant mismatch");
-  return parseStoredCheckpoint(document.checkpointCanonical, expectedTenantId);
+  const checkpoint = parseStoredCheckpoint(document.checkpointCanonical, expectedTenantId);
+  if (
+    document.tenantId !== checkpoint.tenantId ||
+    document.epoch !== checkpoint.epoch ||
+    document.checkpointHash !== checkpoint.hash
+  ) {
+    throw new TypeError("stored retention checkpoint redundant column mismatch");
+  }
+  return checkpoint;
 }
 
 /** Parses exact checkpoint JSON and fails closed on shape, hash, tenant, or non-canonical bytes. */
@@ -1642,16 +1773,38 @@ function assertAttemptFence(
 }
 
 /** Parses and checkpoint-verifies a canonical SQL disposition receipt. */
-function dispositionFromSqlRow(row: Record<string, unknown>, checkpoint: RetentionCheckpoint): RetentionDisposition {
-  return parseStoredDisposition(readString(row, "disposition_canonical"), checkpoint);
+function dispositionFromSqlRow(
+  row: Record<string, unknown>,
+  checkpoint: RetentionCheckpoint,
+  expectedTenantId: string,
+): RetentionDisposition {
+  const disposition = parseStoredDisposition(readString(row, "disposition_canonical"), checkpoint);
+  if (
+    readString(row, "tenant_id") !== expectedTenantId ||
+    readString(row, "checkpoint_hash") !== disposition.checkpointHash
+  ) {
+    throw new TypeError("stored retention disposition redundant column mismatch");
+  }
+  return disposition;
 }
 
 /** Parses and checkpoint-verifies a canonical Mongo disposition receipt. */
 function dispositionFromMongoDocument(
   document: MongoDispositionDocument,
   checkpoint: RetentionCheckpoint,
+  expectedTenantId: string,
 ): RetentionDisposition {
-  return parseStoredDisposition(document.dispositionCanonical, checkpoint);
+  const disposition = parseStoredDisposition(document.dispositionCanonical, checkpoint);
+  if (document.tenantId !== expectedTenantId || document.checkpointHash !== disposition.checkpointHash) {
+    throw new TypeError("stored retention disposition redundant column mismatch");
+  }
+  return disposition;
+}
+
+/** Reads only the canonical receipt checkpoint hash needed to join against verified anchors. */
+function dispositionCheckpointHash(value: string): string {
+  const parsed = parseJsonObject(value, "stored retention disposition");
+  return requireNonEmptyString(parsed.checkpointHash, "stored retention disposition checkpointHash");
 }
 
 /** Parses exact receipt bytes and verifies their checkpoint binding and hash. */
@@ -1826,6 +1979,36 @@ function recordFromMongoDocument(document: MongoAuditDocument, expectedTenantId:
 }
 
 /**
+ * Validates every redundant Mongo audit-document field against its hash-verified
+ * record envelope before legacy state migration can make the chain authoritative.
+ */
+function verifiedMongoAuditDocumentRecord(document: MongoAuditDocument, expectedTenantId: string): AuditRecord {
+  const record = recordFromMongoDocument(document, expectedTenantId);
+  verifiedStoredEventCanonical(record, document.eventCanonical);
+  if (
+    document.sequence !== record.sequence ||
+    document.idempotencyKeyHash !== record.idempotencyKeyHash ||
+    document.hash !== record.hash ||
+    document.previousHash !== record.previousHash ||
+    document.appendedAt !== record.appendedAt
+  ) {
+    throw new TypeError("stored audit record integrity check failed");
+  }
+  return record;
+}
+
+/** Ensures a legacy hot Mongo chain is complete from genesis through its tip. */
+function assertLegacyMongoAuditChain(records: readonly AuditRecord[]): void {
+  let previousHash: string | null = null;
+  for (const [index, record] of records.entries()) {
+    if (record.sequence !== index + 1 || record.previousHash !== previousHash) {
+      throw new TypeError("stored audit record integrity check failed");
+    }
+    previousHash = record.hash;
+  }
+}
+
+/**
  * Parses stored JSON and immediately verifies tenant scope, envelope metadata,
  * and hash integrity before returning a record.
  */
@@ -1974,14 +2157,20 @@ function readSafeInteger(row: Record<string, unknown>, field: string): number {
   return number;
 }
 
+/** Requires a conditional Mongo update to match exactly one authoritative document. */
+function assertMongoUpdateMatched(result: unknown, message: string): void {
+  if (!isRecordObject(result) || result.matchedCount !== 1) throw new TypeError(message);
+}
+
 /**
  * Quotes an identifier or schema-qualified identifier after validating that no
  * caller-controlled SQL syntax can be injected.
  */
 function quoteTableName(tableName: string, dialect: SqlDialect): string {
-  const parts = tableName.split(".");
-  if (parts.length === 0 || parts.length > 2 || parts.some((part) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(part))) {
-    throw new TypeError("tableName must be an identifier or schema-qualified identifier");
+  const parts = splitSqlTableName(tableName);
+  const limit = sqlIdentifierByteLimit(dialect);
+  if (parts.some((part) => Buffer.byteLength(part) > limit)) {
+    throw new TypeError(`tableName identifier exceeds ${limit} bytes`);
   }
 
   return parts
@@ -1989,6 +2178,15 @@ function quoteTableName(tableName: string, dialect: SqlDialect): string {
       return dialect === "postgres" ? `"${part}"` : `\`${part}\``;
     })
     .join(".");
+}
+
+/** Splits and syntax-validates a base or schema-qualified SQL table name. */
+function splitSqlTableName(tableName: string): string[] {
+  const parts = tableName.split(".");
+  if (parts.length === 0 || parts.length > 2 || parts.some((part) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(part))) {
+    throw new TypeError("tableName must be an identifier or schema-qualified identifier");
+  }
+  return parts;
 }
 
 /**

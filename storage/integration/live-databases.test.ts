@@ -1,5 +1,11 @@
-import { describe, test } from "bun:test";
-import { type AuditRecord } from "@veritio/core";
+import { describe, expect, test } from "bun:test";
+import {
+  type AuditRecord,
+  createAuditEvent,
+  createRetentionCheckpoint,
+  createRetentionDisposition,
+  type DispositionAttempt,
+} from "@veritio/core";
 import type { Collection, Db } from "mongodb";
 import mysql, { type Pool as MySqlPool } from "mysql2/promise";
 import pg, { type Pool as PgPool } from "pg";
@@ -15,6 +21,7 @@ import {
   type MongoAuditChainStateDocument,
   type MongoAuditCollection,
   type MongoAuditDocument,
+  type MongoAuditStoreOptions,
   type MongoCheckpointDocument,
   type MongoDispositionAttemptDocument,
   type MongoDispositionDocument,
@@ -101,6 +108,107 @@ function defineSqlLiveSuite(label: string, dialect: SqlDialect, url: string, cre
   });
 }
 
+/** Creates one isolated, indexed Mongo target for deterministic transaction-race regressions. */
+async function createMongoRetentionLiveTarget(url: string) {
+  const { MongoClient } = await import("mongodb");
+  const collectionName = uniqueIdentifier("veritio_mongo_retention_race");
+  const client = new MongoClient(url);
+  await client.connect();
+  const collection = client.db().collection<MongoAuditDocument>(collectionName);
+  const retention = await createMongoRetentionCollections(client.db(), collectionName);
+  for (const index of MONGO_AUDIT_RECORD_INDEXES) await collection.createIndex(index.keys, index.options);
+  const transaction: MongoAuditStoreOptions["transaction"] = async (run) =>
+    client.withSession((session) =>
+      session.withTransaction(async () =>
+        run({ collection: collection as unknown as MongoAuditCollection, options: { session } }),
+      ),
+    );
+  const store = createMongoAuditStore({
+    collection: collection as unknown as MongoAuditCollection,
+    retention,
+    transaction,
+  });
+  return {
+    collection: collection as unknown as MongoAuditCollection,
+    retention,
+    transaction,
+    store,
+    async close() {
+      await collection.drop().catch(ignoreNamespaceMissing);
+      await dropMongoRetentionCollections(retention);
+      await client.close();
+    },
+  };
+}
+
+/** Appends and compacts one record into the durable checkpoint required for disposition races. */
+async function seedMongoDispositionCheckpoint(store: ReturnType<typeof createMongoAuditStore>) {
+  const tenantId = uniqueIdentifier("org_mongo_retention_race");
+  const record = await store.append(
+    createAuditEvent({
+      id: "evt_mongo_retention_race",
+      occurredAt: "2026-08-24T00:01:00.000Z",
+      actor: { type: "system", id: "sys_retention_race" },
+      action: "retention.race.observed",
+      target: { type: "organization", id: tenantId },
+      scope: { tenantId },
+    }),
+  );
+  const checkpoint = createRetentionCheckpoint({
+    checkpointId: "rcp_mongo_retention_race",
+    tenantId,
+    chainKind: "audit",
+    epoch: 1,
+    fromSequence: record.sequence,
+    fromPreviousHash: record.previousHash,
+    throughSequence: record.sequence,
+    throughHash: record.hash,
+    recordCount: 1,
+    archiveRootHash: "a".repeat(64),
+    previousCheckpointHash: null,
+    createdAt: "2026-08-24T01:00:00.000Z",
+  });
+  const state = await store.getChainState({ tenantId });
+  await store.compactRange({ tenantId }, checkpoint, state, state.retentionPolicyFence);
+  return { checkpoint };
+}
+
+/** Pauses exactly one chain-state read so another transaction can advance the fence after the snapshot. */
+function pauseOneMongoChainStateRead(base: MongoRetentionCollection<MongoAuditChainStateDocument>): {
+  collection: MongoRetentionCollection<MongoAuditChainStateDocument>;
+  observed: Promise<void>;
+  release(): void;
+} {
+  let observe!: () => void;
+  let resume!: () => void;
+  let shouldPause = true;
+  const observed = new Promise<void>((resolve) => {
+    observe = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  return {
+    collection: {
+      async findOne(filter, options) {
+        const document = await base.findOne(filter, options);
+        if (shouldPause) {
+          shouldPause = false;
+          observe();
+          await released;
+        }
+        return document;
+      },
+      find: (filter, options) => base.find(filter, options),
+      insertOne: (document, options) => base.insertOne(document, options),
+      updateOne: (filter, update, options) => base.updateOne(filter, update, options),
+      deleteMany: (filter, options) => base.deleteMany(filter, options),
+    },
+    observed,
+    release: resume,
+  };
+}
+
 /**
  * Creates a Postgres live target with schema setup, corruption hooks, and cleanup
  * scoped to one generated table.
@@ -128,7 +236,7 @@ async function createPostgresTarget(url: string, tableName: string) {
       );
     },
     async close() {
-      for (const name of retentionTableNames(tableName).reverse()) {
+      for (const name of retentionTableNames(tableName, "postgres").reverse()) {
         await pool.query(`DROP TABLE IF EXISTS ${quotePostgresIdentifier(name)}`);
       }
       await pool.end();
@@ -164,7 +272,7 @@ async function createMySqlTarget(url: string, tableName: string) {
       );
     },
     async close() {
-      for (const name of retentionTableNames(tableName).reverse()) {
+      for (const name of retentionTableNames(tableName, "mysql").reverse()) {
         await pool.query(`DROP TABLE IF EXISTS ${quoteMySqlIdentifier(name)}`);
       }
       await pool.end();
@@ -323,6 +431,89 @@ function defineMongoLiveSuite(url: string): void {
     })) {
       test(conformanceTest.name, conformanceTest.run);
     }
+
+    test("mongodb live prepare rejects a fence advanced after its snapshot read", async () => {
+      const target = await createMongoRetentionLiveTarget(url);
+      try {
+        const { checkpoint } = await seedMongoDispositionCheckpoint(target.store);
+        const barrier = pauseOneMongoChainStateRead(target.retention.chainStates);
+        const racingStore = createMongoAuditStore({
+          collection: target.collection,
+          retention: { ...target.retention, chainStates: barrier.collection },
+          transaction: target.transaction,
+        });
+        const attempt: DispositionAttempt = {
+          attemptId: "attempt_prepare_snapshot_race",
+          checkpointHash: checkpoint.hash,
+          policyFence: 0,
+          status: "pending",
+        };
+        const preparing = racingStore.prepareDisposition(
+          { tenantId: checkpoint.tenantId },
+          checkpoint.hash,
+          attempt,
+          0,
+        );
+        await barrier.observed;
+        await target.store.advanceRetentionPolicyFence({ tenantId: checkpoint.tenantId }, 0);
+        barrier.release();
+
+        await expect(preparing).rejects.toThrow("retention policy fence mismatch");
+        expect(
+          await target.retention.dispositionAttempts.findOne({
+            tenantId: checkpoint.tenantId,
+            checkpointHash: checkpoint.hash,
+          }),
+        ).toBeNull();
+      } finally {
+        await target.close();
+      }
+    });
+
+    test("mongodb live confirm rejects a fence advanced after its snapshot read", async () => {
+      const target = await createMongoRetentionLiveTarget(url);
+      try {
+        const { checkpoint } = await seedMongoDispositionCheckpoint(target.store);
+        const attempt: DispositionAttempt = {
+          attemptId: "attempt_confirm_snapshot_race",
+          checkpointHash: checkpoint.hash,
+          policyFence: 0,
+          status: "pending",
+        };
+        await target.store.prepareDisposition({ tenantId: checkpoint.tenantId }, checkpoint.hash, attempt, 0);
+        const receipt = createRetentionDisposition({
+          dispositionId: "disposition_confirm_snapshot_race",
+          tenantId: checkpoint.tenantId,
+          chainKind: "audit",
+          checkpointHash: checkpoint.hash,
+          fromSequence: checkpoint.fromSequence,
+          throughSequence: checkpoint.throughSequence,
+          archiveRootHash: checkpoint.archiveRootHash,
+          policyReference: "policy.snapshot-race",
+          disposedAt: "2026-08-24T02:00:00.000Z",
+        });
+        const barrier = pauseOneMongoChainStateRead(target.retention.chainStates);
+        const racingStore = createMongoAuditStore({
+          collection: target.collection,
+          retention: { ...target.retention, chainStates: barrier.collection },
+          transaction: target.transaction,
+        });
+        const confirming = racingStore.confirmDisposition(
+          { tenantId: checkpoint.tenantId },
+          receipt,
+          attempt.attemptId,
+          0,
+        );
+        await barrier.observed;
+        await target.store.advanceRetentionPolicyFence({ tenantId: checkpoint.tenantId }, 0);
+        barrier.release();
+
+        await expect(confirming).rejects.toThrow("retention policy fence mismatch");
+        expect(await target.store.listDispositions({ tenantId: checkpoint.tenantId })).toEqual([]);
+      } finally {
+        await target.close();
+      }
+    });
   });
 }
 
@@ -351,8 +542,10 @@ async function mutateMongoStoredRecord(
  */
 function createPostgresSchemaStatements(tableName: string): string[] {
   const table = quotePostgresIdentifier(tableName);
-  const [, chainState, idempotency, checkpoints, attempts, dispositions] =
-    retentionTableNames(tableName).map(quotePostgresIdentifier);
+  const [, chainState, idempotency, checkpoints, attempts, dispositions] = retentionTableNames(
+    tableName,
+    "postgres",
+  ).map(quotePostgresIdentifier);
   return [
     `CREATE TABLE IF NOT EXISTS ${table} (
     tenant_id text NOT NULL,
@@ -414,8 +607,9 @@ function createPostgresSchemaStatements(tableName: string): string[] {
  */
 function createMySqlSchemaStatements(tableName: string): string[] {
   const table = quoteMySqlIdentifier(tableName);
-  const [, chainState, idempotency, checkpoints, attempts, dispositions] =
-    retentionTableNames(tableName).map(quoteMySqlIdentifier);
+  const [, chainState, idempotency, checkpoints, attempts, dispositions] = retentionTableNames(tableName, "mysql").map(
+    quoteMySqlIdentifier,
+  );
   return [
     `CREATE TABLE IF NOT EXISTS ${table} (
     tenant_id varchar(255) NOT NULL,
@@ -475,8 +669,8 @@ function createMySqlSchemaStatements(tableName: string): string[] {
 }
 
 /** Derives the records table plus every additive retention companion table. */
-function retentionTableNames(tableName: string): string[] {
-  const names = getSqlAuditRetentionTableNames(tableName);
+function retentionTableNames(tableName: string, dialect: SqlDialect): string[] {
+  const names = getSqlAuditRetentionTableNames(tableName, dialect);
   return [
     names.records,
     names.chainState,
