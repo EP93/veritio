@@ -7,6 +7,8 @@ import {
   type AuditStore,
 } from "@veritio/core";
 
+export * from "./retention-conformance.js";
+
 type MaybePromise<T> = T | Promise<T>;
 
 export interface AuditStoreConformanceCorruption {
