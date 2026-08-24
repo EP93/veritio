@@ -7,14 +7,14 @@
   },
   "metadata": {
     "description": "Veritio evidence-layer plugins for Claude Code \u2014 tamper-evident session capture and hosted MCP.",
-    "version": "0.1.1"
+    "version": "0.1.2"
   },
   "plugins": [
     {
       "name": "veritio",
       "source": "./plugins/veritio",
       "description": "Tamper-evident audit trail for Claude Code sessions + a hosted MCP to query your evidence.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "author": {
         "name": "Veritio"
       },

@@ -20,7 +20,8 @@ const TIMESTAMP_PATTERN = /^\d{4}-(0[1-9]|1[0-2])-([0-2]\d|3[01])T([01]\d|2[0-3]
 /**
  * Public feature identity for hosts that must fail closed unless the installed
  * storage package resolves disposal time after confirmed provider absence and
- * replays accepted receipts without consulting a clock again.
+ * requires an attempt-idempotent resolver when receipt persistence retries,
+ * while accepted receipts replay without consulting a clock again.
  */
 export const RETENTION_COORDINATOR_CAPABILITY = Object.freeze({
   api: "runRetentionEpoch",
@@ -28,6 +29,8 @@ export const RETENTION_COORDINATOR_CAPABILITY = Object.freeze({
   protocol: "veritio.retention",
   schemaVersion: "1.0",
   resolvesDisposedAtAfterConfirmedAbsence: true,
+  requiresAttemptIdempotentDisposedAtResolver: true,
+  mayReinvokeDisposedAtAfterReceiptPersistenceFailure: true,
   replaysAcceptedDispositionWithoutResolvingDisposedAt: true,
 } as const);
 
@@ -84,7 +87,13 @@ export interface ResolveRetentionDisposedAtContext {
   readonly policyFence: number;
 }
 
-/** Host-injected trusted clock boundary; core and storage never read host time or environment state. */
+/**
+ * Host-injected trusted clock boundary. A receipt-persistence failure can cause
+ * the coordinator to invoke this resolver again after reconfirming absence, so
+ * the host must durably return the same exact UTC-millisecond value for the
+ * same tenant, checkpoint, attempt, disposition, and policy-fence context.
+ * Core and storage never read host time or environment state themselves.
+ */
 export type RetentionDisposedAtResolver = (context: ResolveRetentionDisposedAtContext) => Promise<string>;
 
 /**

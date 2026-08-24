@@ -109,14 +109,16 @@ absence confirmation, and receipt confirmation. The helpers read no
 environment, credentials, clock, or legal-hold state; hosts supply those
 boundaries and must re-evaluate eligibility/version on every retry.
 
-`resolveDisposedAt` is invoked exactly once for a new receipt, after deletion
-and both absence checks succeed and immediately before receipt creation. Its
-only context fields are `tenantId`, a detached checkpoint clone, `attemptId`,
-`dispositionId`, and `policyFence`. It must return an exact UTC-millisecond
-instant such as `2026-08-25T00:00:00.000Z`; rejection or malformed output fails
-closed without persisting a receipt. Delete and absence failures never invoke
-it. A cold replay with an already accepted disposition verifies and returns the
-stored receipt byte-for-byte without invoking the callback.
+`resolveDisposedAt` runs after deletion and both absence checks succeed,
+immediately before each receipt-creation attempt. Its only context fields are
+`tenantId`, a detached checkpoint clone, `attemptId`, `dispositionId`, and
+`policyFence`. Receipt persistence can fail after resolution, so a retry may
+invoke the callback again with the same exact context. The host must durably
+return the same exact UTC-millisecond instant for that context; otherwise one
+provider disposal could produce conflicting receipts. Rejection or malformed
+output fails closed without persisting a receipt. Delete and absence failures
+never invoke it. A cold replay with an already accepted disposition verifies
+and returns the stored receipt byte-for-byte without invoking the callback.
 
 Hosts can gate the installed public package identities and retention behavior
 without reading package files or environment variables:
@@ -133,6 +135,8 @@ if (
   VERITIO_CORE_VERSION !== "0.4.8" ||
   VERITIO_STORAGE_VERSION !== "0.4.8" ||
   !RETENTION_COORDINATOR_CAPABILITY.resolvesDisposedAtAfterConfirmedAbsence ||
+  !RETENTION_COORDINATOR_CAPABILITY.requiresAttemptIdempotentDisposedAtResolver ||
+  !RETENTION_COORDINATOR_CAPABILITY.mayReinvokeDisposedAtAfterReceiptPersistenceFailure ||
   !RETENTION_COORDINATOR_CAPABILITY.replaysAcceptedDispositionWithoutResolvingDisposedAt
 ) {
   throw new Error("unsupported Veritio retention coordinator");
@@ -140,13 +144,10 @@ if (
 
 const resolveDisposedAt: RetentionDisposedAtResolver = async (
   { tenantId, checkpoint, attemptId, dispositionId, policyFence },
-) => trustedHostClock.confirmedProviderAbsenceTime({
-  tenantId,
-  checkpointHash: checkpoint.hash,
-  attemptId,
-  dispositionId,
-  policyFence,
-});
+) => durableDispositionTimes.resolveOrCreate(
+  { tenantId, checkpointHash: checkpoint.hash, attemptId, dispositionId, policyFence },
+  () => trustedHostClock.nowUtcMilliseconds(),
+);
 ```
 
 Cold retries inspect authoritative checkpoints and accepted dispositions before

@@ -224,7 +224,7 @@ describe("retention coordinator", () => {
     expect(receipt).toBeLessThan(confirm);
   });
 
-  test("resolves the confirmed disposal time exactly once with a detached privacy-minimal context", async () => {
+  test("invokes the resolver once on a successful new receipt with a detached privacy-minimal context", async () => {
     const log: string[] = [];
     const store = await seedStore();
     const client = createClient(log);
@@ -535,7 +535,7 @@ describe("retention coordinator", () => {
     }
   });
 
-  test("a crash after confirmed provider absence retries receipt confirmation without re-upload", async () => {
+  test("a receipt-persistence crash re-invokes an attempt-idempotent resolver and recreates byte-identical receipt", async () => {
     const log: string[] = [];
     const realStore = await seedStore();
     const client = createClient(log);
@@ -557,14 +557,40 @@ describe("retention coordinator", () => {
         return realStore.confirmDisposition(...args);
       },
     };
-    const options = await runOptions(crashingStore, client);
+    let resolverCalls = 0;
+    const disposedAtByContext = new Map<string, string>();
+    const resolvedContexts: string[] = [];
+    const receiptBytes: string[] = [];
+    const options = await runOptions(crashingStore, client, {
+      resolveDisposedAt: async (context: unknown) => {
+        resolverCalls += 1;
+        const contextBytes = canonicalJson(context);
+        resolvedContexts.push(contextBytes);
+        const durable = disposedAtByContext.get(contextBytes) ?? "2026-08-24T01:02:00.000Z";
+        disposedAtByContext.set(contextBytes, durable);
+        return durable;
+      },
+      createDisposition: (input: RetentionDispositionInput) => {
+        const receipt = createRetentionDisposition(input);
+        receiptBytes.push(canonicalJson(receipt));
+        return receipt;
+      },
+    });
     await expect(runRetentionEpoch(options)).rejects.toThrow("crash after delete before confirm");
+    expect(resolverCalls).toBe(1);
+    expect(receiptBytes).toHaveLength(1);
     expect(client.objects.size).toBe(0);
     expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([]);
     log.length = 0;
 
     const replayed = await runRetentionEpoch(options);
 
+    expect(resolverCalls).toBe(2);
+    expect(new Set(resolvedContexts).size).toBe(1);
+    expect(receiptBytes).toHaveLength(2);
+    expect(receiptBytes[1]).toBe(receiptBytes[0]);
+    expect(replayed.disposition.disposedAt).toBe("2026-08-24T01:02:00.000Z");
+    expect(canonicalJson(replayed.disposition)).toBe(receiptBytes[0]);
     expect(log).not.toContain("archive.put");
     expect(client.objects.size).toBe(0);
     expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([replayed.disposition]);

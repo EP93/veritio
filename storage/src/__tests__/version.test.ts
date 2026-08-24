@@ -11,6 +11,8 @@ test("exports exact coordinated package identities and the immutable retention c
     protocol: "veritio.retention",
     schemaVersion: "1.0",
     resolvesDisposedAtAfterConfirmedAbsence: true,
+    requiresAttemptIdempotentDisposedAtResolver: true,
+    mayReinvokeDisposedAtAfterReceiptPersistenceFailure: true,
     replaysAcceptedDispositionWithoutResolvingDisposedAt: true,
   });
   expect(Object.isFrozen(RETENTION_COORDINATOR_CAPABILITY)).toBe(true);

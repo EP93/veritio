@@ -10,6 +10,7 @@ const core = readJson("sdks/typescript/package.json");
 const storage = readJson("storage/package.json");
 const claude = readJson("adapters/claude-code/package.json");
 const plugin = readJson("plugins/veritio/.claude-plugin/plugin.json");
+const marketplace = readJson(".claude-plugin/marketplace.json");
 const hooks = readJson("plugins/veritio/hooks/hooks.json");
 const lockfile = readFileSync(resolve(root, "bun.lock"), "utf8");
 
@@ -56,13 +57,25 @@ if (commands.some((command) => /@latest|bunx\s+-y|@veritio\/claude-code\s/.test(
   throw new Error("Claude plugin hooks must never auto-select an unreviewed package version");
 }
 assertEqual(plugin.defaultEnabled, false, "hosted-connected plugin must remain disabled by default");
+const pluginVersion = stringAt(plugin, "version");
+assertEqual(pluginVersion, "0.1.3", "hook pin update must advance the Claude plugin manifest");
+assertEqual(
+  stringAt(recordAt(marketplace, "plugins", 0), "version"),
+  pluginVersion,
+  "marketplace cache must match the Claude plugin manifest",
+);
+assertEqual(
+  stringAt(marketplace, "metadata", "version"),
+  "0.1.2",
+  "marketplace catalog update must advance with the plugin cache",
+);
 assertEqual(MAX_INGEST_TIMEOUT_MS, 30_000, "Codex remote attempt maximum must stay finite");
 
 console.log(
   JSON.stringify({
     outcome: "ok",
     releaseVersion,
-    pluginVersion: stringAt(plugin, "version"),
+    pluginVersion,
     pinnedClaudeVersion: releaseVersion,
     codexMaximumRemoteAttemptMs: MAX_INGEST_TIMEOUT_MS,
   }),
@@ -71,6 +84,16 @@ console.log(
 /** Reads one repository JSON document without accepting comments or coercion. */
 function readJson(path: string): Record<string, unknown> {
   return JSON.parse(readFileSync(resolve(root, path), "utf8")) as Record<string, unknown>;
+}
+
+/** Reads one required object entry from an array-valued document field. */
+function recordAt(document: Record<string, unknown>, field: string, index: number): Record<string, unknown> {
+  const values = document[field];
+  const value = Array.isArray(values) ? values[index] : undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`missing ${field}.${index}`);
+  }
+  return value as Record<string, unknown>;
 }
 
 /** Reads one required string through a sequence of object keys. */

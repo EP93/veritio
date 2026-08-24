@@ -8,6 +8,21 @@ Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while th
 
 ### Added
 
+- The first published retention protocol surface defines audit-only
+  `retention.checkpoint` and `retention.disposition` schemas, canonical hashes,
+  optional Ed25519 signatures, conformance fixtures, and matching constructor
+  and verification APIs across TypeScript, Python, and Go.
+- Authoritative memory, PostgreSQL/Neon, MySQL/MariaDB, and transactional MongoDB
+  stores implement checkpointed prefix crop, durable chain state, permanent
+  idempotency tombstones, monotonic policy fences, and disposition-attempt CAS.
+- The derived object-staging archive preserves exact NDJSON bytes and the
+  host-injected retention coordinator enforces epoch leases, two policy fences,
+  staged verification, provider deletion, and independent direct-plus-prefix
+  absence confirmation before a receipt can be persisted.
+- Checkpoint-aware `vevb-2` export bundles carry closed checkpoint/disposition
+  records and explicit retention-signature trust results. The CLI verifies and
+  reports both bundle versions, and the self-hosted server/MCP can build v2 only
+  from explicit host-injected checkpoint inputs.
 - `@veritio/core/version` and `@veritio/storage/version` expose immutable exact
   package identity tokens for server hosts that cannot read package metadata.
 - `@veritio/storage/retention` exposes a frozen retention-coordinator
@@ -18,13 +33,15 @@ Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while th
 
 - The first public retention coordinator contract resolves `disposedAt` through
   an asynchronous host callback only after staged deletion and direct-plus-prefix
-  absence confirmation. Existing accepted receipts replay byte-for-byte without
-  consulting the callback; deletion, absence, callback, and timestamp failures
-  persist no receipt.
+  absence confirmation. The host must durably return the same time for the same
+  attempt context because receipt-persistence retries may re-invoke it. Existing
+  accepted receipts replay byte-for-byte without consulting the callback;
+  deletion, absence, callback, and timestamp failures persist no receipt.
 - Released `@veritio/core`, `@veritio/storage`, and `@veritio/claude-code`
   0.4.8 as one train. Claude Code pins core and storage exactly at 0.4.8, and
   all seven plugin hooks pin the exact Claude Code package version. Independent
-  framework adapters remain on their own release cadence.
+  framework adapters remain on their own release cadence. The Claude plugin
+  manifest/cache advances to 0.1.3 and the marketplace catalog to 0.1.2.
 
 ### Safety
 
