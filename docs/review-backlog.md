@@ -13,6 +13,16 @@ decisions that deserve a coordinated `veritio-protocol-change` /
 
 ## Landed (this pass)
 
+- **Retention checkpoints and staged disposal (OSS) — LANDED 2026-08-24.**
+  Audit-only v1 checkpoint/disposition records and parity helpers now exist in
+  TypeScript, Python, and Go. Postgres/Neon, MySQL/MariaDB, MongoDB, and the
+  in-memory test store implement the authoritative checkpoint contract with
+  real-database conformance; the separate staging archive/coordinator uses a
+  host-injected epoch lease and policy fences. `vevb-2` verifies the complete
+  checkpoint chain plus retained audit tail without changing `vevb-1` bytes or
+  defaults. This is evidence support/audit-trail functionality, not an
+  automatic legal-compliance claim.
+
 - **K — scoped-key revoke TOCTOU** (`veritio-cloud`): the revoke `UPDATE` now
   carries an `isNull(revoked_at)` guard and returns the existing row on a
   0-row race, so a concurrent double-revoke can no longer overwrite the original
@@ -43,6 +53,19 @@ decisions that deserve a coordinated `veritio-protocol-change` /
   agent-capture adapter are tracked under `.claude/rules/02-sdk-parity.md`.
 
 ## Deferred — protocol-change / cross-repo cycle
+
+### Retention follow-ups deliberately outside v1
+
+- **Evidence-edge and EvidenceCommit checkpoints — DEFERRED.** Their chains
+  remain genesis/full-chain in v1; do not crop them through the audit-store
+  contract.
+- **Crash-safe `FileEvidenceStore` retention — DEFERRED.** A file adapter needs
+  a specified journal/snapshot transaction before it can become authoritative
+  and checkpoint-capable.
+- **Derived-tier authority — REJECTED.** ClickHouse and R2/S3/ObjectAuditArchive
+  remain derived and cannot own sequence, idempotency, verify/DSAR answers, or
+  long-term replay. A host needing cold retention must migrate to a conforming
+  authoritative store rather than promote an archive.
 
 ### C — revision id collides on rollback to an identical earlier state
 - **Decision (2026-07-17): DEFERRED PAST CLOUD LAUNCH.** The change-scoped

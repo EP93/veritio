@@ -22,6 +22,73 @@ Host applications must provide a transaction-capable client wrapper. The store
 uses tenant-scoped append ordering, idempotency-key hashes, expected previous
 hash checks, and persisted record integrity validation.
 
+## Audit Retention Checkpoints
+
+Retention checkpointing is an **audit-chain-only** capability in v1. The
+Postgres/Neon, MySQL/MariaDB, and Mongo factories return a
+`CheckpointingAuditStore`; it preserves the authoritative tenant tip separately
+from hot rows, atomically records a checkpoint and crops its exact covered
+prefix, and preserves the minimum idempotency ledger needed to reject a
+post-crop duplicate. `MemoryAuditStore` in `@veritio/core` implements the same
+contract for tests, not as production durability.
+
+Before activating retention on an existing authoritative database, apply the
+additive schema constant (`POSTGRES_AUDIT_RECORDS_SCHEMA_SQL` or
+`MYSQL_AUDIT_RECORDS_SCHEMA_SQL`) before any checkpoint/crop call. The schema
+backfills each tenant's chain state from its current verified tip; then run the
+retention conformance suite against a real database before scheduling a worker.
+For Mongo, provision the collections passed through `retention`, create
+`MONGO_RETENTION_INDEXES` as well as `MONGO_AUDIT_RECORD_INDEXES`, backfill and
+verify a chain-state document for every existing tenant, and use a replica-set
+transaction boundary. Do not enable crops until that backfill and real-DB
+conformance have succeeded.
+
+```ts
+import {
+  POSTGRES_AUDIT_RECORDS_SCHEMA_SQL,
+  createPostgresAuditStore,
+} from "@veritio/storage";
+import { createRetentionStoreConformanceTests } from "@veritio/storage/conformance";
+
+await host.executor.execute(POSTGRES_AUDIT_RECORDS_SCHEMA_SQL, []);
+const store = createPostgresAuditStore({ client: host.executor });
+
+// Register the returned cases with the host test runner against a real database.
+const cases = createRetentionStoreConformanceTests({
+  name: "postgres retention",
+  createTarget: async () => ({ store }),
+});
+void cases;
+```
+
+Only audit records are capable in v1. Evidence-edge chains and
+`EvidenceCommit` remain genesis/full-chain records; `FileEvidenceStore`, the
+ClickHouse read model, and `ObjectAuditArchive` do not implement
+`CheckpointingAuditStore`. A future file adapter needs a crash-safe
+journal/snapshot transaction before it can be capable.
+
+### Derived staging and disposal
+
+`createRetentionStagingArchive` is a separate, short-lived derived safety copy
+for one explicit epoch. It intentionally does not widen `ObjectAuditArchive`.
+`runRetentionEpoch` executes `seal → verify → compact → prepare → delete →
+confirm`: it requires a host-injected durable per-tenant epoch lease and two
+host-injected policy-fence callbacks. The first fence guards the crop; the
+second remains held through provider deletion, direct-read plus prefix-list
+absence confirmation, and receipt confirmation. The helpers read no
+environment, credentials, clock, or legal-hold state; hosts supply those
+boundaries and must re-evaluate eligibility/version on every retry.
+
+R2/S3 (and MinIO-compatible clients) are never authoritative: they cannot own
+sequences, idempotency, verification, DSAR answers, or a restore path. A
+checkpoint and its disposition receipt attest to a verified anchor and a
+provider-delete attempt. They do **not** prove that every provider replica or
+backup has been erased, and, after disposal, Veritio has no epoch event bodies
+available for replay. The receipt is deliberately minimal: it omits event
+bodies/metadata, legal-hold rationale, user identity, bucket keys, and raw
+provider responses; hosts keep operational evidence in their own
+access-controlled audit systems.
+
 ## Transactional Outbox
 
 The storage package exports the public outbox contract used by governed-change
@@ -180,6 +247,11 @@ describe("postgres live AuditStore conformance", () => {
 The host harness owns database clients, credentials, connection strings, test
 containers, and cleanup. Keep environment-variable reads in the test bootstrap
 or CI setup, not in `storage/src`.
+
+`createRetentionStoreConformanceTests` adds crop-boundary, retained-tip,
+idempotency-tombstone, policy-fence, and unique-disposition coverage for every
+authoritative `CheckpointingAuditStore`. Run it against the actual database;
+unit-only success cannot validate transactional retention semantics.
 
 ## External DB Checks
 
