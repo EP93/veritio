@@ -31,20 +31,30 @@ legal-hold state. Existing genesis-only audit verification is unchanged; use
 the anchored verifier for the retained tail.
 
 ```go
-checkpoint, err := veritio.CreateRetentionCheckpoint(veritio.RetentionCheckpointInput{
-    CheckpointID: "rcp_org_123_1", TenantID: "org_123", ChainKind: "audit",
-    Epoch: 1, FromSequence: 1, ThroughSequence: 1000,
-    ThroughHash: strings.Repeat("a", 64), RecordCount: 1000,
-    ArchiveRootHash: strings.Repeat("b", 64),
-    CreatedAt: "2026-08-24T00:00:00.000Z",
-}, nil)
-if err != nil { return err }
+import (
+    "fmt"
+    "strings"
 
-if result := veritio.VerifyRetentionCheckpointChain([]veritio.RetentionCheckpoint{checkpoint}, nil); !result.OK {
-    return fmt.Errorf("checkpoint verification failed: %s", result.Reason)
-}
-if result := veritio.VerifyAuditRecordsFromCheckpoint(checkpoint, retainedAuditRecords, nil); !result.OK {
-    return fmt.Errorf("tail verification failed: %s", result.Reason)
+    veritio "github.com/getveritio/veritio/sdks/go"
+)
+
+func verifyRetainedTail(retainedAuditRecords []veritio.AuditRecord) error {
+    checkpoint, err := veritio.CreateRetentionCheckpoint(veritio.RetentionCheckpointInput{
+        CheckpointID: "rcp_org_123_1", TenantID: "org_123", ChainKind: "audit",
+        Epoch: 1, FromSequence: 1, ThroughSequence: 1000,
+        ThroughHash: strings.Repeat("a", 64), RecordCount: 1000,
+        ArchiveRootHash: strings.Repeat("b", 64),
+        CreatedAt: "2026-08-24T00:00:00.000Z",
+    }, nil)
+    if err != nil { return err }
+
+    if result := veritio.VerifyRetentionCheckpointChain([]veritio.RetentionCheckpoint{checkpoint}, nil); !result.OK {
+        return fmt.Errorf("checkpoint verification failed: %s", result.Reason)
+    }
+    if result := veritio.VerifyAuditRecordsFromCheckpoint(checkpoint, retainedAuditRecords, nil); !result.OK {
+        return fmt.Errorf("tail verification failed: %s", result.Reason)
+    }
+    return nil
 }
 ```
 

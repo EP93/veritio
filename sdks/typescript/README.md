@@ -129,12 +129,16 @@ verified checkpoint.
 
 ```ts
 import {
+  type AuditRecord,
   createRetentionCheckpoint,
   createRetentionDisposition,
   verifyAuditRecordsFromCheckpoint,
   verifyRetentionCheckpointChain,
   verifyRetentionDisposition,
 } from "@veritio/core";
+
+// Fetch only the current hot tail from the authoritative checkpointing store.
+const retainedAuditRecords: AuditRecord[] = [];
 
 const checkpoint = createRetentionCheckpoint({
   checkpointId: "rcp_org_123_1",

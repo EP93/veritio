@@ -34,31 +34,51 @@ contract for tests, not as production durability.
 
 Before activating retention on an existing authoritative database, apply the
 additive schema constant (`POSTGRES_AUDIT_RECORDS_SCHEMA_SQL` or
-`MYSQL_AUDIT_RECORDS_SCHEMA_SQL`) before any checkpoint/crop call. The schema
-backfills each tenant's chain state from its current verified tip; then run the
-retention conformance suite against a real database before scheduling a worker.
+`MYSQL_AUDIT_RECORDS_SCHEMA_SQL`) before any checkpoint/crop call. Its SQL
+backfill selects the highest legacy sequence/hash for each tenant; it does not
+replay or validate the historical chain. Before treating that seeded state as
+authoritative, the host must integrity-replay every legacy tenant with
+`verifyAuditRecords` and investigate any failure. Then run retention
+conformance against a real database before scheduling a worker.
+
 For Mongo, provision the collections passed through `retention`, create
-`MONGO_RETENTION_INDEXES` as well as `MONGO_AUDIT_RECORD_INDEXES`, backfill and
-verify a chain-state document for every existing tenant, and use a replica-set
-transaction boundary. Do not enable crops until that backfill and real-DB
-conformance have succeeded.
+`MONGO_RETENTION_INDEXES` as well as `MONGO_AUDIT_RECORD_INDEXES`, and use a
+replica-set transaction boundary. Run `backfillMongoAuditRetentionState` for
+each legacy tenant: it verifies the complete hot chain and atomically writes
+that tenant's chain state and minimal idempotency ledger. Do not enable crops
+until every tenant backfill and real-DB conformance have succeeded.
 
 ```ts
 import {
+  MONGO_AUDIT_RECORD_INDEXES,
+  MONGO_RETENTION_INDEXES,
   POSTGRES_AUDIT_RECORDS_SCHEMA_SQL,
+  backfillMongoAuditRetentionState,
   createPostgresAuditStore,
 } from "@veritio/storage";
 import { createRetentionStoreConformanceTests } from "@veritio/storage/conformance";
 
-await host.executor.execute(POSTGRES_AUDIT_RECORDS_SCHEMA_SQL, []);
-const store = createPostgresAuditStore({ client: host.executor });
-
-// Register the returned cases with the host test runner against a real database.
-const cases = createRetentionStoreConformanceTests({
+// Each returned conformance case must receive an empty, isolated real database
+// target. `host.createIsolatedPostgresTarget` is application test-harness code.
+for (const conformanceTest of createRetentionStoreConformanceTests({
   name: "postgres retention",
-  createTarget: async () => ({ store }),
-});
-void cases;
+  createTarget: async () => {
+    const target = await host.createIsolatedPostgresTarget();
+    await target.executor.execute(POSTGRES_AUDIT_RECORDS_SCHEMA_SQL, []);
+    return {
+      store: createPostgresAuditStore({ client: target.executor }),
+      close: () => target.close(),
+    };
+  },
+})) {
+  test(conformanceTest.name, conformanceTest.run);
+}
+
+await host.createIndexes(MONGO_AUDIT_RECORD_INDEXES);
+await host.createRetentionIndexes(MONGO_RETENTION_INDEXES);
+for (const tenantId of legacyTenantIds) {
+  await backfillMongoAuditRetentionState(mongoOptions, { tenantId });
+}
 ```
 
 Only audit records are capable in v1. Evidence-edge chains and

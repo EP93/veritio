@@ -61,6 +61,9 @@ from veritio import (
     verify_retention_disposition,
 )
 
+# The caller supplies the current hot tail from its authoritative store.
+retained_audit_records: list[dict] = []
+
 checkpoint = create_retention_checkpoint({
     "checkpointId": "rcp_org_123_1",
     "tenantId": "org_123",
