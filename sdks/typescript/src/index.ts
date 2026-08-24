@@ -1,4 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  verifyRetentionCheckpoint,
+  verifyRetentionDisposition,
+  type RetentionCheckpoint,
+  type RetentionDisposition,
+} from "./retention.js";
 
 export const SCHEMA_VERSION = "2026-06-10";
 export const EDGE_SCHEMA_VERSION = "2026-06-13";
@@ -255,6 +261,67 @@ export interface AuditStoreListOptions {
 export interface AuditStore {
   append(event: AuditEvent, options?: AuditStoreAppendOptions): Promise<AuditRecord>;
   list(scope: EvidenceScope & { tenantId: string }, options?: AuditStoreListOptions): Promise<AuditRecord[]>;
+}
+
+/**
+ * Captures the authoritative tenant audit-chain tip and retention CAS boundary
+ * independently from hot record rows so a fully cropped chain can still append.
+ */
+export interface AuditChainState {
+  authoritativeTipSequence: number;
+  authoritativeTipHash: string | null;
+  minimumRetainedSequence: number;
+  latestCheckpointHash: string | null;
+  retentionPolicyFence: number;
+}
+
+/**
+ * Names the opaque monotonic host-policy version used to fence destructive
+ * retention operations without putting legal-hold details into OSS records.
+ */
+export type RetentionPolicyFence = number;
+
+/**
+ * Binds one provider-disposal attempt to a checkpoint and exact policy fence;
+ * only the store may transition a pending attempt to disposed.
+ */
+export interface DispositionAttempt {
+  attemptId: string;
+  checkpointHash: string;
+  policyFence: RetentionPolicyFence;
+  status: "pending" | "disposed";
+}
+
+/**
+ * Extends the source-compatible AuditStore with audit-only checkpoint crop and
+ * disposition CAS operations; derived archives never implement this authority.
+ */
+export interface CheckpointingAuditStore extends AuditStore {
+  getChainState(scope: EvidenceScope & { tenantId: string }): Promise<AuditChainState>;
+  advanceRetentionPolicyFence(
+    scope: EvidenceScope & { tenantId: string },
+    expectedVersion: RetentionPolicyFence,
+  ): Promise<RetentionPolicyFence>;
+  compactRange(
+    scope: EvidenceScope & { tenantId: string },
+    checkpoint: RetentionCheckpoint,
+    expected: AuditChainState,
+    policyFence: RetentionPolicyFence,
+  ): Promise<void>;
+  listCheckpoints(scope: EvidenceScope & { tenantId: string }): Promise<RetentionCheckpoint[]>;
+  prepareDisposition(
+    scope: EvidenceScope & { tenantId: string },
+    checkpointHash: string,
+    attempt: DispositionAttempt,
+    expectedPolicyFence: RetentionPolicyFence,
+  ): Promise<DispositionAttempt>;
+  confirmDisposition(
+    scope: EvidenceScope & { tenantId: string },
+    receipt: RetentionDisposition,
+    expectedAttemptId: string,
+    expectedPolicyFence: RetentionPolicyFence,
+  ): Promise<void>;
+  listDispositions(scope: EvidenceScope & { tenantId: string }): Promise<RetentionDisposition[]>;
 }
 
 export interface AuditRecorder {
@@ -647,10 +714,16 @@ export function createAuditRecorder(options: { store: AuditStore }): AuditRecord
  * scenarios. It preserves tenant isolation, idempotency replay, and hash-chain
  * semantics without implying production durability.
  */
-export class MemoryAuditStore implements AuditStore {
+export class MemoryAuditStore implements CheckpointingAuditStore {
   #records: AuditRecord[] = [];
-  #idempotencyRecords = new Map<string, { eventCanonical: string; record: AuditRecord }>();
-  #tenantTips = new Map<string, AuditRecord>();
+  #idempotencyRecords = new Map<
+    string,
+    { eventCanonicalHash: string; originalSequence: number; originalRecordHash: string; record?: AuditRecord }
+  >();
+  #tenantChainStates = new Map<string, AuditChainState>();
+  #tenantCheckpoints = new Map<string, RetentionCheckpoint[]>();
+  #tenantDispositionAttempts = new Map<string, Map<string, DispositionAttempt>>();
+  #tenantDispositions = new Map<string, Map<string, RetentionDisposition>>();
 
   /**
    * Appends one audit event to the tenant-local in-memory hash chain. Idempotent
@@ -661,24 +734,28 @@ export class MemoryAuditStore implements AuditStore {
     const tenantId = requireTenantId(event);
     const idempotencyKeyHash = hashIdempotencyKey(tenantId, options.idempotencyKey ?? event.id);
     const eventCanonical = canonicalJson(event);
+    const eventCanonicalHash = sha256Hex(eventCanonical);
     const storedEvent = cloneEvent(event);
     const existing = this.#idempotencyRecords.get(idempotencyKeyHash);
     if (existing) {
-      if (existing.eventCanonical !== eventCanonical) {
+      if (existing.eventCanonicalHash !== eventCanonicalHash) {
         throw new TypeError("idempotency conflict");
+      }
+      if (!existing.record) {
+        throw new TypeError("idempotency_history_disposed");
       }
       return cloneRecord(existing.record);
     }
 
-    const previousRecord = this.#tenantTips.get(tenantId);
-    const previousHash = previousRecord?.hash ?? null;
+    const chainState = this.#chainState(tenantId);
+    const previousHash = chainState.authoritativeTipHash;
     if (options.expectedPreviousHash !== undefined && options.expectedPreviousHash !== previousHash) {
       throw new TypeError("expectedPreviousHash does not match tenant chain tip");
     }
 
     const recordWithoutHash: Omit<AuditRecord, "hash"> = {
       event: storedEvent,
-      sequence: (previousRecord?.sequence ?? 0) + 1,
+      sequence: chainState.authoritativeTipSequence + 1,
       previousHash,
       hashAlgorithm: HASH_ALGORITHM,
       canonicalization: "veritio-json-v1",
@@ -691,8 +768,17 @@ export class MemoryAuditStore implements AuditStore {
     };
 
     this.#records.push(record);
-    this.#tenantTips.set(tenantId, record);
-    this.#idempotencyRecords.set(idempotencyKeyHash, { eventCanonical, record });
+    this.#tenantChainStates.set(tenantId, {
+      ...chainState,
+      authoritativeTipSequence: record.sequence,
+      authoritativeTipHash: record.hash,
+    });
+    this.#idempotencyRecords.set(idempotencyKeyHash, {
+      eventCanonicalHash,
+      originalSequence: record.sequence,
+      originalRecordHash: record.hash,
+      record,
+    });
     return cloneRecord(record);
   }
 
@@ -721,11 +807,276 @@ export class MemoryAuditStore implements AuditStore {
   }
 
   /**
+   * Returns the minimal authoritative tenant state even when compaction removed
+   * every hot row, keeping append sequence and hash authority intact.
+   */
+  async getChainState(scope: EvidenceScope & { tenantId: string }): Promise<AuditChainState> {
+    assertNonEmpty(scope.tenantId, "scope.tenantId");
+    return cloneAuditChainState(this.#chainState(scope.tenantId));
+  }
+
+  /**
+   * Atomically increments the opaque retention-policy fence only when the host
+   * presents the exact current version, allowing queued hold changes to win.
+   */
+  async advanceRetentionPolicyFence(
+    scope: EvidenceScope & { tenantId: string },
+    expectedVersion: RetentionPolicyFence,
+  ): Promise<RetentionPolicyFence> {
+    assertNonEmpty(scope.tenantId, "scope.tenantId");
+    assertRetentionPolicyFence(expectedVersion);
+    const current = this.#chainState(scope.tenantId);
+    if (current.retentionPolicyFence !== expectedVersion) {
+      throw new TypeError("retention policy fence mismatch");
+    }
+    if (!Number.isSafeInteger(current.retentionPolicyFence + 1)) {
+      throw new TypeError("retention policy fence exhausted");
+    }
+    const next = current.retentionPolicyFence + 1;
+    this.#tenantChainStates.set(scope.tenantId, { ...current, retentionPolicyFence: next });
+    return next;
+  }
+
+  /**
+   * Validates an exact audit-prefix checkpoint and all CAS boundaries before one
+   * in-memory commit crops hot rows, tombstones idempotency, and advances state.
+   */
+  async compactRange(
+    scope: EvidenceScope & { tenantId: string },
+    checkpoint: RetentionCheckpoint,
+    expected: AuditChainState,
+    policyFence: RetentionPolicyFence,
+  ): Promise<void> {
+    assertNonEmpty(scope.tenantId, "scope.tenantId");
+    assertRetentionPolicyFence(policyFence);
+    assertAuditChainState(expected);
+    const current = this.#chainState(scope.tenantId);
+    if (!auditChainStatesEqual(current, expected)) {
+      throw new TypeError("audit chain state mismatch");
+    }
+    if (policyFence !== current.retentionPolicyFence || expected.retentionPolicyFence !== policyFence) {
+      throw new TypeError("retention policy fence mismatch");
+    }
+    const checkpointVerification = verifyRetentionCheckpoint(checkpoint);
+    if (!checkpointVerification.ok) {
+      throw new TypeError(`invalid retention checkpoint: ${checkpointVerification.reason}`);
+    }
+    if (checkpoint.tenantId !== scope.tenantId || checkpoint.chainKind !== "audit") {
+      throw new TypeError("checkpoint tenant or chain kind mismatch");
+    }
+
+    const checkpoints = this.#tenantCheckpoints.get(scope.tenantId) ?? [];
+    const previousCheckpoint = checkpoints.at(-1);
+    if (
+      checkpoint.epoch !== checkpoints.length + 1 ||
+      checkpoint.previousCheckpointHash !== (previousCheckpoint?.hash ?? null) ||
+      checkpoint.fromSequence !== current.minimumRetainedSequence ||
+      checkpoint.fromPreviousHash !== (previousCheckpoint?.throughHash ?? null)
+    ) {
+      throw new TypeError("checkpoint prefix or prior checkpoint mismatch");
+    }
+    if (checkpoint.throughSequence > current.authoritativeTipSequence) {
+      throw new TypeError("checkpoint range exceeds authoritative tip");
+    }
+
+    const coveredRecords = this.#records
+      .filter(
+        (record) =>
+          record.event.scope?.tenantId === scope.tenantId &&
+          record.sequence >= checkpoint.fromSequence &&
+          record.sequence <= checkpoint.throughSequence,
+      )
+      .sort((left, right) => left.sequence - right.sequence);
+    if (coveredRecords.length !== checkpoint.recordCount) {
+      throw new TypeError("checkpoint range is not an intact hot prefix");
+    }
+    let expectedPreviousHash = checkpoint.fromPreviousHash;
+    for (const [index, record] of coveredRecords.entries()) {
+      if (
+        record.sequence !== checkpoint.fromSequence + index ||
+        record.previousHash !== expectedPreviousHash ||
+        hashAuditRecord(record) !== record.hash
+      ) {
+        throw new TypeError("checkpoint range failed authoritative integrity validation");
+      }
+      expectedPreviousHash = record.hash;
+    }
+    if (expectedPreviousHash !== checkpoint.throughHash) {
+      throw new TypeError("checkpoint throughHash does not match authoritative boundary");
+    }
+
+    const coveredIdempotencyHashes = new Set(coveredRecords.map((record) => record.idempotencyKeyHash));
+    const retainedRecords = this.#records.filter(
+      (record) =>
+        record.event.scope?.tenantId !== scope.tenantId ||
+        record.sequence < checkpoint.fromSequence ||
+        record.sequence > checkpoint.throughSequence,
+    );
+    const storedCheckpoints = [...checkpoints, cloneRetentionCheckpoint(checkpoint)];
+    const nextState: AuditChainState = {
+      ...current,
+      minimumRetainedSequence: checkpoint.throughSequence + 1,
+      latestCheckpointHash: checkpoint.hash,
+    };
+
+    this.#records = retainedRecords;
+    for (const idempotencyKeyHash of coveredIdempotencyHashes) {
+      const entry = this.#idempotencyRecords.get(idempotencyKeyHash);
+      if (entry) {
+        this.#idempotencyRecords.set(idempotencyKeyHash, {
+          eventCanonicalHash: entry.eventCanonicalHash,
+          originalSequence: entry.originalSequence,
+          originalRecordHash: entry.originalRecordHash,
+        });
+      }
+    }
+    this.#tenantCheckpoints.set(scope.tenantId, storedCheckpoints);
+    this.#tenantChainStates.set(scope.tenantId, nextState);
+  }
+
+  /**
+   * Lists cloned tenant checkpoints in epoch order so callers cannot mutate the
+   * authoritative anchors used by later crops and disposal receipt validation.
+   */
+  async listCheckpoints(scope: EvidenceScope & { tenantId: string }): Promise<RetentionCheckpoint[]> {
+    assertNonEmpty(scope.tenantId, "scope.tenantId");
+    return (this.#tenantCheckpoints.get(scope.tenantId) ?? []).map(cloneRetentionCheckpoint);
+  }
+
+  /**
+   * Creates or idempotently replays a pending disposition attempt, allowing a
+   * crashed attempt to be rebound only to the same checkpoint at a newer fence.
+   */
+  async prepareDisposition(
+    scope: EvidenceScope & { tenantId: string },
+    checkpointHash: string,
+    attempt: DispositionAttempt,
+    expectedPolicyFence: RetentionPolicyFence,
+  ): Promise<DispositionAttempt> {
+    assertNonEmpty(scope.tenantId, "scope.tenantId");
+    assertNonEmpty(checkpointHash, "checkpointHash");
+    assertDispositionAttempt(attempt);
+    assertRetentionPolicyFence(expectedPolicyFence);
+    const current = this.#chainState(scope.tenantId);
+    if (current.retentionPolicyFence !== expectedPolicyFence || attempt.policyFence !== expectedPolicyFence) {
+      throw new TypeError("retention policy fence mismatch");
+    }
+    if (attempt.status !== "pending" || attempt.checkpointHash !== checkpointHash) {
+      throw new TypeError("disposition attempt binding mismatch");
+    }
+    const checkpoint = (this.#tenantCheckpoints.get(scope.tenantId) ?? []).find(
+      (candidate) => candidate.hash === checkpointHash,
+    );
+    if (!checkpoint) {
+      throw new TypeError("disposition checkpoint not found");
+    }
+    if (this.#tenantDispositions.get(scope.tenantId)?.has(checkpointHash)) {
+      throw new TypeError("checkpoint disposition already confirmed");
+    }
+
+    const attempts = this.#tenantDispositionAttempts.get(scope.tenantId) ?? new Map<string, DispositionAttempt>();
+    const existing = attempts.get(checkpointHash);
+    if (existing) {
+      if (canonicalJson(existing) === canonicalJson(attempt)) {
+        return cloneDispositionAttempt(existing);
+      }
+      if (existing.status !== "pending" || attempt.policyFence <= existing.policyFence) {
+        throw new TypeError("disposition attempt conflict");
+      }
+    }
+
+    const storedAttempt = cloneDispositionAttempt(attempt);
+    attempts.set(checkpointHash, storedAttempt);
+    this.#tenantDispositionAttempts.set(scope.tenantId, attempts);
+    return cloneDispositionAttempt(storedAttempt);
+  }
+
+  /**
+   * Verifies a receipt against its checkpoint and atomically CASes the current
+   * pending attempt plus policy fence before accepting one unique disposition.
+   */
+  async confirmDisposition(
+    scope: EvidenceScope & { tenantId: string },
+    receipt: RetentionDisposition,
+    expectedAttemptId: string,
+    expectedPolicyFence: RetentionPolicyFence,
+  ): Promise<void> {
+    assertNonEmpty(scope.tenantId, "scope.tenantId");
+    assertNonEmpty(expectedAttemptId, "expectedAttemptId");
+    assertRetentionPolicyFence(expectedPolicyFence);
+    const current = this.#chainState(scope.tenantId);
+    if (current.retentionPolicyFence !== expectedPolicyFence) {
+      throw new TypeError("retention policy fence mismatch");
+    }
+    const attempts = this.#tenantDispositionAttempts.get(scope.tenantId);
+    const attemptEntry = [...(attempts?.entries() ?? [])].find(([, attempt]) => attempt.attemptId === expectedAttemptId);
+    if (!attemptEntry) {
+      throw new TypeError("disposition attempt mismatch");
+    }
+    const [checkpointHash, attempt] = attemptEntry;
+    if (attempt.policyFence !== expectedPolicyFence || attempt.checkpointHash !== checkpointHash) {
+      throw new TypeError("disposition attempt fence mismatch");
+    }
+    const checkpoint = (this.#tenantCheckpoints.get(scope.tenantId) ?? []).find(
+      (candidate) => candidate.hash === checkpointHash,
+    );
+    if (!checkpoint) {
+      throw new TypeError("disposition checkpoint not found");
+    }
+    const dispositions = this.#tenantDispositions.get(scope.tenantId) ?? new Map<string, RetentionDisposition>();
+    const existing = dispositions.get(checkpointHash);
+    if (existing) {
+      if (attempt.status === "disposed" && canonicalJson(existing) === canonicalJson(receipt)) {
+        return;
+      }
+      throw new TypeError("conflicting disposition receipt");
+    }
+    if (attempt.status !== "pending") {
+      throw new TypeError("disposition attempt is not pending");
+    }
+    const receiptVerification = verifyRetentionDisposition(receipt, checkpoint);
+    if (!receiptVerification.ok) {
+      throw new TypeError(`invalid retention disposition: ${receiptVerification.reason}`);
+    }
+
+    dispositions.set(checkpointHash, cloneRetentionDisposition(receipt));
+    attempts?.set(checkpointHash, { ...attempt, status: "disposed" });
+    this.#tenantDispositions.set(scope.tenantId, dispositions);
+  }
+
+  /**
+   * Lists cloned accepted receipts in checkpoint epoch order, never exposing
+   * pending attempts or mutable authoritative disposition state.
+   */
+  async listDispositions(scope: EvidenceScope & { tenantId: string }): Promise<RetentionDisposition[]> {
+    assertNonEmpty(scope.tenantId, "scope.tenantId");
+    const dispositions = this.#tenantDispositions.get(scope.tenantId);
+    return (this.#tenantCheckpoints.get(scope.tenantId) ?? [])
+      .map((checkpoint) => dispositions?.get(checkpoint.hash))
+      .filter((receipt): receipt is RetentionDisposition => receipt !== undefined)
+      .map(cloneRetentionDisposition);
+  }
+
+  /**
    * Returns a cloned snapshot for local verification and tests without exposing
    * mutable references to the store's internal record array.
    */
   records(): AuditRecord[] {
     return this.#records.map(cloneRecord);
+  }
+
+  /**
+   * Reads an existing authoritative chain-state row or supplies the untouched
+   * tenant genesis state without persisting unnecessary empty tenant entries.
+   */
+  #chainState(tenantId: string): AuditChainState {
+    return this.#tenantChainStates.get(tenantId) ?? {
+      authoritativeTipSequence: 0,
+      authoritativeTipHash: null,
+      minimumRetainedSequence: 1,
+      latestCheckpointHash: null,
+      retentionPolicyFence: 0,
+    };
   }
 }
 
@@ -1130,6 +1481,101 @@ function cloneEvent(event: AuditEvent): AuditEvent {
  */
 function cloneRecord(record: AuditRecord): AuditRecord {
   return JSON.parse(JSON.stringify(record)) as AuditRecord;
+}
+
+/**
+ * Clones authoritative chain CAS state before returning it across the store
+ * boundary so callers cannot mutate a later expected-state comparison.
+ */
+function cloneAuditChainState(state: AuditChainState): AuditChainState {
+  return { ...state };
+}
+
+/**
+ * Clones checkpoint protocol records, including optional detached signatures,
+ * before storing or returning an authoritative retention anchor.
+ */
+function cloneRetentionCheckpoint(checkpoint: RetentionCheckpoint): RetentionCheckpoint {
+  return JSON.parse(JSON.stringify(checkpoint)) as RetentionCheckpoint;
+}
+
+/**
+ * Clones disposition attempts so caller mutation cannot alter a pending or
+ * disposed compare-and-swap binding after preparation.
+ */
+function cloneDispositionAttempt(attempt: DispositionAttempt): DispositionAttempt {
+  return { ...attempt };
+}
+
+/**
+ * Clones accepted disposition receipts before persistence or return, preserving
+ * the byte-significant protocol fields while isolating mutable references.
+ */
+function cloneRetentionDisposition(disposition: RetentionDisposition): RetentionDisposition {
+  return JSON.parse(JSON.stringify(disposition)) as RetentionDisposition;
+}
+
+/**
+ * Validates the non-negative safe-integer policy version used by store CAS
+ * operations; zero is the untouched tenant fence and remains a valid token.
+ */
+function assertRetentionPolicyFence(value: unknown): asserts value is RetentionPolicyFence {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError("retention policy fence must be a non-negative safe integer");
+  }
+}
+
+/**
+ * Validates caller-supplied expected chain state before comparing it with the
+ * authoritative snapshot, rejecting malformed state rather than coercing it.
+ */
+function assertAuditChainState(value: AuditChainState): void {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !Number.isSafeInteger(value.authoritativeTipSequence) ||
+    value.authoritativeTipSequence < 0 ||
+    !Number.isSafeInteger(value.minimumRetainedSequence) ||
+    value.minimumRetainedSequence < 1 ||
+    value.minimumRetainedSequence > value.authoritativeTipSequence + 1 ||
+    (value.authoritativeTipHash !== null && !/^[a-f0-9]{64}$/.test(value.authoritativeTipHash)) ||
+    (value.latestCheckpointHash !== null && !/^[a-f0-9]{64}$/.test(value.latestCheckpointHash))
+  ) {
+    throw new TypeError("invalid audit chain state");
+  }
+  assertRetentionPolicyFence(value.retentionPolicyFence);
+}
+
+/**
+ * Compares every authoritative crop boundary explicitly so omitted or stale
+ * fields cannot accidentally satisfy a partial expected-state check.
+ */
+function auditChainStatesEqual(left: AuditChainState, right: AuditChainState): boolean {
+  return (
+    left.authoritativeTipSequence === right.authoritativeTipSequence &&
+    left.authoritativeTipHash === right.authoritativeTipHash &&
+    left.minimumRetainedSequence === right.minimumRetainedSequence &&
+    left.latestCheckpointHash === right.latestCheckpointHash &&
+    left.retentionPolicyFence === right.retentionPolicyFence
+  );
+}
+
+/**
+ * Validates the minimal non-personal attempt envelope before it can replace a
+ * durable pending attempt or participate in disposition confirmation.
+ */
+function assertDispositionAttempt(attempt: DispositionAttempt): void {
+  if (typeof attempt !== "object" || attempt === null) {
+    throw new TypeError("invalid disposition attempt");
+  }
+  assertNonEmpty(attempt.attemptId, "attempt.attemptId");
+  if (!/^[a-f0-9]{64}$/.test(attempt.checkpointHash)) {
+    throw new TypeError("attempt.checkpointHash must be lowercase sha256");
+  }
+  assertRetentionPolicyFence(attempt.policyFence);
+  if (attempt.status !== "pending" && attempt.status !== "disposed") {
+    throw new TypeError("attempt.status is invalid");
+  }
 }
 
 /**
