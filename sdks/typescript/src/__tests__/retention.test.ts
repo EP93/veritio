@@ -31,13 +31,31 @@ function ed25519Verifier(publicKey: Uint8Array, signature: Uint8Array, message: 
 }
 
 describe("retention checkpoint protocol", () => {
-  test("schemas require calendar-valid UTC milliseconds and reject year zero", async () => {
+  test("schema patterns enforce calendar-valid UTC milliseconds without format assertion", async () => {
     for (const fileName of ["retention-checkpoint.schema.json", "retention-disposition.schema.json"]) {
       const schema = (await Bun.file(join(import.meta.dir, `../../../../spec/${fileName}`)).json()) as {
         $defs: { timestamp: { format?: string; pattern: string } };
       };
+      const timestampPattern = new RegExp(schema.$defs.timestamp.pattern);
       expect(schema.$defs.timestamp.format).toBe("date-time");
-      expect(new RegExp(schema.$defs.timestamp.pattern).test("0000-01-01T00:00:00.000Z")).toBeFalse();
+      for (const invalid of [
+        "0000-01-01T00:00:00.000Z",
+        "2026-02-30T00:00:00.000Z",
+        "2025-02-29T00:00:00.000Z",
+        "1900-02-29T00:00:00.000Z",
+        "2026-04-31T00:00:00.000Z",
+      ]) {
+        expect(timestampPattern.test(invalid)).toBeFalse();
+      }
+      for (const valid of [
+        "0001-01-01T00:00:00.000Z",
+        "2000-02-29T23:59:59.999Z",
+        "2024-02-29T00:00:00.000Z",
+        "2025-02-28T00:00:00.000Z",
+        "9999-12-31T23:59:59.999Z",
+      ]) {
+        expect(timestampPattern.test(valid)).toBeTrue();
+      }
     }
   });
 
