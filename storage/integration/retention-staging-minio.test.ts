@@ -50,13 +50,17 @@ function defineRetentionStagingLiveSuite(liveEndpoint: string): void {
       const archive = createRetentionStagingArchive({ client, prefix: runPrefix });
 
       try {
-        const manifest = await archive.sealEpoch({
+        const input = {
           tenantId: "org_live_retention",
           epoch: 2,
           previousCheckpoint,
           records: chain.slice(2),
           segmentRecordCount: 1,
-        });
+        };
+        const derived = archive.deriveEpoch(input);
+        expect(await client.list(`${runPrefix}/`)).toEqual([]);
+        const manifest = await archive.sealEpoch(input);
+        expect(manifest).toEqual(derived);
         expect(await archive.verifyEpoch(manifest)).toEqual({
           ok: true,
           archiveRootHash: manifest.archiveRootHash,

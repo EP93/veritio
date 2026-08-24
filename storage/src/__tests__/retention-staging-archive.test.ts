@@ -95,6 +95,23 @@ function firstCheckpoint(chain: readonly AuditRecord[]) {
 }
 
 describe("retention staging archive", () => {
+  test("derives the deterministic candidate manifest without any provider write", async () => {
+    const chain = records(3);
+    const client = createMemoryRetentionClient();
+    const archive = createRetentionStagingArchive({ client });
+    const input = {
+      tenantId: TENANT_ID,
+      epoch: 2,
+      previousCheckpoint: firstCheckpoint(chain),
+      records: chain.slice(2),
+    };
+
+    const derived = await archive.deriveEpoch(input);
+
+    expect(client.objects.size).toBe(0);
+    expect(await archive.sealEpoch(input)).toEqual(derived);
+  });
+
   test("seals epoch one only from the genesis anchor", async () => {
     const chain = records(2);
     const archive = createRetentionStagingArchive({ client: createMemoryRetentionClient() });

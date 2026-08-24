@@ -101,6 +101,7 @@ export type RetentionStagingVerification =
 
 /** Separate derived staging surface for one exact retention epoch. */
 export interface RetentionStagingArchive {
+  deriveEpoch(input: SealRetentionEpochInput): RetentionStagingManifest;
   sealEpoch(input: SealRetentionEpochInput): Promise<RetentionStagingManifest>;
   verifyEpoch(manifest: RetentionStagingManifest): Promise<RetentionStagingVerification>;
   deleteEpoch(manifest: RetentionStagingManifest): Promise<void>;
@@ -123,23 +124,21 @@ export function createRetentionStagingArchive(options: RetentionStagingArchiveOp
   const client = options.client;
 
   /**
-   * Seals deterministic exact-byte NDJSON segments and commits their manifest
-   * last. Existing byte-identical objects are replayed; conflicting bytes fail
-   * closed instead of being overwritten during a crash retry.
+   * Deterministically validates and derives one epoch manifest, including exact
+   * content digests and provider-neutral root, without reading or writing the
+   * provider. Coordinators use this to recognize completed work safely.
    */
-  async function sealEpoch(input: SealRetentionEpochInput): Promise<RetentionStagingManifest> {
+  function deriveEpoch(input: SealRetentionEpochInput): RetentionStagingManifest {
     const segmentRecordCount = input.segmentRecordCount ?? 1000;
     assertPositiveSafeInteger(segmentRecordCount, "segmentRecordCount");
     const anchor = validateSealInput(input);
     const epochPrefix = epochKeyPrefix(prefix, input.tenantId, input.epoch);
     const segments: RetentionStagingSegment[] = [];
-
     for (let offset = 0; offset < input.records.length; offset += segmentRecordCount) {
       const batch = input.records.slice(offset, offset + segmentRecordCount);
       const first = batch[0]!;
       const last = batch.at(-1)!;
       const body = encodeNdjson(batch);
-      const objectKey = `${epochPrefix}/${padSequence(first.sequence)}-${padSequence(last.sequence)}.ndjson`;
       segments.push({
         fromSequence: first.sequence,
         toSequence: last.sequence,
@@ -147,13 +146,9 @@ export function createRetentionStagingArchive(options: RetentionStagingArchiveOp
         firstPreviousHash: first.previousHash,
         lastHash: last.hash,
         contentSha256: sha256Bytes(body),
-        objectKey,
+        objectKey: `${epochPrefix}/${padSequence(first.sequence)}-${padSequence(last.sequence)}.ndjson`,
       });
-      await putExact(client, objectKey, body);
     }
-
-    const descriptors = segments.map(providerNeutralDescriptor);
-    const manifestKey = `${epochPrefix}/manifest.json`;
     const manifest: RetentionStagingManifest = {
       recordType: "retention.staging.manifest",
       schemaVersion: "1.0",
@@ -165,12 +160,29 @@ export function createRetentionStagingArchive(options: RetentionStagingArchiveOp
       throughHash: input.records.at(-1)!.hash,
       recordCount: input.records.length,
       previousCheckpointHash: anchor.checkpointHash,
-      archiveRootHash: sha256Text(canonicalJson(descriptors)),
+      archiveRootHash: sha256Text(canonicalJson(segments.map(providerNeutralDescriptor))),
       segments,
-      manifestKey,
+      manifestKey: `${epochPrefix}/manifest.json`,
     };
     validateManifest(manifest, prefix);
-    await putExact(client, manifestKey, new TextEncoder().encode(canonicalJson(manifest)));
+    return cloneManifest(manifest);
+  }
+
+  /**
+   * Seals deterministic exact-byte NDJSON segments and commits their manifest
+   * last. Existing byte-identical objects are replayed; conflicting bytes fail
+   * closed instead of being overwritten during a crash retry.
+   */
+  async function sealEpoch(input: SealRetentionEpochInput): Promise<RetentionStagingManifest> {
+    const manifest = deriveEpoch(input);
+    let offset = 0;
+    for (const segment of manifest.segments) {
+      const batch = input.records.slice(offset, offset + segment.recordCount);
+      const body = encodeNdjson(batch);
+      await putExact(client, segment.objectKey, body);
+      offset += segment.recordCount;
+    }
+    await putExact(client, manifest.manifestKey, new TextEncoder().encode(canonicalJson(manifest)));
     return cloneManifest(manifest);
   }
 
@@ -271,7 +283,7 @@ export function createRetentionStagingArchive(options: RetentionStagingArchiveOp
     return directReadsAbsent && listedKeys.length === 0;
   }
 
-  return { sealEpoch, verifyEpoch, deleteEpoch, confirmEpochAbsent };
+  return { deriveEpoch, sealEpoch, verifyEpoch, deleteEpoch, confirmEpochAbsent };
 }
 
 /** Validates the caller's tenant, prior anchor, exact range, and record hashes before any write. */

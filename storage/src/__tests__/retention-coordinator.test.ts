@@ -259,6 +259,58 @@ describe("retention coordinator", () => {
     expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([result.disposition]);
   });
 
+  test("a completed disposition rerun proves absence and returns the accepted receipt without provider writes", async () => {
+    const log: string[] = [];
+    const store = await seedStore();
+    const client = createClient(log);
+    const options = await runOptions(store, client);
+    const first = await runRetentionEpoch(options);
+    expect(client.objects.size).toBe(0);
+    log.length = 0;
+
+    const replayed = await runRetentionEpoch(options);
+
+    expect(replayed).toEqual(first);
+    expect(log).not.toContain("archive.put");
+    expect(client.objects.size).toBe(0);
+    expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([first.disposition]);
+  });
+
+  test("a crash after confirmed provider absence retries receipt confirmation without re-upload", async () => {
+    const log: string[] = [];
+    const realStore = await seedStore();
+    const client = createClient(log);
+    let crashBeforeConfirm = true;
+    const crashingStore: CheckpointingAuditStore = {
+      append: realStore.append.bind(realStore),
+      list: realStore.list.bind(realStore),
+      getChainState: realStore.getChainState.bind(realStore),
+      advanceRetentionPolicyFence: realStore.advanceRetentionPolicyFence.bind(realStore),
+      compactRange: realStore.compactRange.bind(realStore),
+      listCheckpoints: realStore.listCheckpoints.bind(realStore),
+      prepareDisposition: realStore.prepareDisposition.bind(realStore),
+      listDispositions: realStore.listDispositions.bind(realStore),
+      async confirmDisposition(...args) {
+        if (crashBeforeConfirm) {
+          crashBeforeConfirm = false;
+          throw new Error("crash after delete before confirm");
+        }
+        return realStore.confirmDisposition(...args);
+      },
+    };
+    const options = await runOptions(crashingStore, client);
+    await expect(runRetentionEpoch(options)).rejects.toThrow("crash after delete before confirm");
+    expect(client.objects.size).toBe(0);
+    expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([]);
+    log.length = 0;
+
+    const replayed = await runRetentionEpoch(options);
+
+    expect(log).not.toContain("archive.put");
+    expect(client.objects.size).toBe(0);
+    expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([replayed.disposition]);
+  });
+
   test("a fresh-fence retry supersedes a pending crashed deletion attempt and accepts no stale receipt", async () => {
     const log: string[] = [];
     const store = await seedStore();

@@ -95,20 +95,14 @@ export interface RunRetentionEpochResult {
 export async function runRetentionEpoch(options: RunRetentionEpochOptions): Promise<RunRetentionEpochResult> {
   validateCoordinatorInputs(options);
   const epoch = (options.previousCheckpoint?.epoch ?? 0) + 1;
-  const manifest = await options.archive.sealEpoch({
+  const epochInput = {
     tenantId: options.tenantId,
     epoch,
     previousCheckpoint: options.previousCheckpoint,
     records: options.records,
     ...(options.segmentRecordCount === undefined ? {} : { segmentRecordCount: options.segmentRecordCount }),
-  });
-  const archiveVerification = await options.archive.verifyEpoch(manifest);
-  if (!archiveVerification.ok) {
-    throw new TypeError("staged retention epoch verification failed");
-  }
-  if (archiveVerification.archiveRootHash !== manifest.archiveRootHash) {
-    throw new TypeError("staged retention archive root mismatch");
-  }
+  };
+  const manifest = options.archive.deriveEpoch(epochInput);
 
   const checkpointInput: RetentionCheckpointInput = {
     checkpointId: options.checkpoint.checkpointId,
@@ -126,6 +120,45 @@ export async function runRetentionEpoch(options: RunRetentionEpochOptions): Prom
   };
   const checkpoint = options.createCheckpoint(checkpointInput);
   assertCheckpointFactoryBinding(checkpoint, checkpointInput);
+  assertVerifiedCheckpoint(checkpoint, options.verification);
+
+  const preflightCheckpoints = await options.store.listCheckpoints({ tenantId: options.tenantId });
+  const preflightCheckpoint = preflightCheckpoints.find((candidate) => candidate.epoch === checkpoint.epoch);
+  if (preflightCheckpoint && canonicalJson(preflightCheckpoint) !== canonicalJson(checkpoint)) {
+    throw new TypeError("retention checkpoint replay conflict");
+  }
+  const preflightDisposition = (await options.store.listDispositions({ tenantId: options.tenantId })).find(
+    (candidate) => candidate.checkpointHash === checkpoint.hash,
+  );
+  if (preflightDisposition) {
+    if (!preflightCheckpoint) throw new TypeError("retention disposition checkpoint is missing");
+    const expectedReceipt = createAndVerifyDisposition(options, checkpoint);
+    if (canonicalJson(preflightDisposition) !== canonicalJson(expectedReceipt)) {
+      throw new TypeError("retention disposition replay conflict");
+    }
+    if (!(await options.archive.confirmEpochAbsent(manifest))) {
+      throw new TypeError("staged retention epoch is present after confirmed disposition");
+    }
+    return {
+      manifest: cloneManifest(manifest),
+      checkpoint: cloneCheckpoint(checkpoint),
+      disposition: cloneDisposition(preflightDisposition),
+    };
+  }
+
+  if (!preflightCheckpoint) {
+    const sealedManifest = await options.archive.sealEpoch(epochInput);
+    if (canonicalJson(sealedManifest) !== canonicalJson(manifest)) {
+      throw new TypeError("staged retention manifest derivation mismatch");
+    }
+    const archiveVerification = await options.archive.verifyEpoch(manifest);
+    if (!archiveVerification.ok) {
+      throw new TypeError("staged retention epoch verification failed");
+    }
+    if (archiveVerification.archiveRootHash !== manifest.archiveRootHash) {
+      throw new TypeError("staged retention archive root mismatch");
+    }
+  }
 
   await options.withPolicyFence(options.eligibility.version, async () => {
     assertVerifiedCheckpoint(checkpoint, options.verification);
