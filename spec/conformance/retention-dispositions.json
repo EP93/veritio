@@ -25,5 +25,11 @@
   "mismatchRejections": [
     { "name": "checkpoint-hash", "field": "checkpointHash", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
     { "name": "archive-root", "field": "archiveRootHash", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
+  ],
+  "signatureConstructorRejections": [
+    {
+      "name": "signature-fingerprint-does-not-match-bound-fingerprint",
+      "publicKeyFingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
   ]
 }

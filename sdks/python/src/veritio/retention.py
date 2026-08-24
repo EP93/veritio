@@ -21,6 +21,18 @@ _TIMESTAMP_PATTERN = re.compile(
     r"^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$"
 )
 _BASE64_SIGNATURE_PATTERN = re.compile(r"^[A-Za-z0-9+/]{86}==$")
+_CHECKPOINT_RECORD_KEYS = {
+    "recordType", "schemaVersion", "checkpointId", "tenantId", "chainKind", "epoch", "fromSequence",
+    "fromPreviousHash", "throughSequence", "throughHash", "recordCount", "archiveRootHash",
+    "previousCheckpointHash", "createdAt", "canonicalization", "hashAlgorithm",
+    "signaturePublicKeyFingerprint", "hash", "signature",
+}
+_DISPOSITION_RECORD_KEYS = {
+    "recordType", "schemaVersion", "dispositionId", "tenantId", "chainKind", "checkpointHash",
+    "fromSequence", "throughSequence", "archiveRootHash", "method", "policyReference", "disposedAt",
+    "canonicalization", "hashAlgorithm", "signaturePublicKeyFingerprint", "hash", "signature",
+}
+_SIGNATURE_KEYS = {"algorithm", "publicKeyFingerprint", "signature"}
 
 SignatureVerifier = Callable[[bytes, bytes, bytes], bool]
 
@@ -42,7 +54,7 @@ def hash_retention_checkpoint(checkpoint: dict[str, Any]) -> str:
 
 
 def verify_retention_checkpoint(
-    checkpoint: dict[str, Any],
+    checkpoint: Any,
     *,
     trusted_public_key: bytes | None = None,
     signature_verifier: SignatureVerifier | None = None,
@@ -154,8 +166,8 @@ def hash_retention_disposition(disposition: dict[str, Any]) -> str:
 
 
 def verify_retention_disposition(
-    disposition: dict[str, Any],
-    checkpoint: dict[str, Any],
+    disposition: Any,
+    checkpoint: Any,
     *,
     trusted_public_key: bytes | None = None,
     signature_verifier: SignatureVerifier | None = None,
@@ -169,6 +181,8 @@ def verify_retention_disposition(
     )
     if not checkpoint_result["ok"]:
         return checkpoint_result
+    if not isinstance(disposition, dict) or not _has_only_keys(disposition, _DISPOSITION_RECORD_KEYS):
+        return _failure(0, "invalid_disposition", "absent")
     if (
         disposition.get("recordType") != "retention.disposition"
         or disposition.get("schemaVersion") != RETENTION_SCHEMA_VERSION
@@ -204,7 +218,7 @@ def verify_retention_disposition(
 
 
 def _verify_checkpoint_at(
-    checkpoint: dict[str, Any],
+    checkpoint: Any,
     index: int,
     *,
     trusted_public_key: bytes | None,
@@ -212,6 +226,8 @@ def _verify_checkpoint_at(
     require_signature: bool,
 ) -> dict[str, Any]:
     """Apply shape, hash, and injected signature gates to one checkpoint at a stable result index."""
+    if not isinstance(checkpoint, dict) or not _has_only_keys(checkpoint, _CHECKPOINT_RECORD_KEYS):
+        return _failure(index, "invalid_checkpoint", "absent")
     if (
         checkpoint.get("recordType") != "retention.checkpoint"
         or checkpoint.get("schemaVersion") != RETENTION_SCHEMA_VERSION
@@ -254,6 +270,8 @@ def _verify_detached_signature(
         or signature.get("publicKeyFingerprint") != fingerprint
     ):
         return ("invalid", "signature_fingerprint_mismatch")
+    if not _has_only_keys(signature, _SIGNATURE_KEYS):
+        return ("invalid", "signature_invalid")
     if signature.get("algorithm") != "ed25519" or not isinstance(signature.get("signature"), str):
         return ("invalid", "signature_invalid")
     try:
@@ -444,6 +462,8 @@ def _assert_signature_pair(fingerprint: Any, signature: dict[str, Any] | None) -
     if signature.get("algorithm") != "ed25519":
         raise TypeError("signature algorithm must be ed25519")
     _assert_hash(signature.get("publicKeyFingerprint"), "signature.publicKeyFingerprint")
+    if signature["publicKeyFingerprint"] != fingerprint:
+        raise TypeError("signature public key fingerprint must match the bound fingerprint")
     encoded = signature.get("signature")
     if not isinstance(encoded, str) or not _BASE64_SIGNATURE_PATTERN.fullmatch(encoded):
         raise TypeError("signature must be padded base64")
@@ -496,3 +516,8 @@ def _combine_signature_status(current: str, next_status: str) -> str:
     if "absent" in (current, next_status):
         return "absent"
     return "valid"
+
+
+def _has_only_keys(value: dict[str, Any], allowed: set[str]) -> bool:
+    """Mirror schema additionalProperties false when verifying untrusted runtime dictionaries."""
+    return all(key in allowed for key in value)

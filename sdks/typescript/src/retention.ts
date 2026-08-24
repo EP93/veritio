@@ -11,6 +11,18 @@ const POLICY_REFERENCE_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/;
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const TIMESTAMP_PATTERN = /^\d{4}-(0[1-9]|1[0-2])-([0-2]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$/;
 const BASE64_SIGNATURE_PATTERN = /^[A-Za-z0-9+/]{86}==$/;
+const CHECKPOINT_RECORD_KEYS = new Set([
+  "recordType", "schemaVersion", "checkpointId", "tenantId", "chainKind", "epoch", "fromSequence",
+  "fromPreviousHash", "throughSequence", "throughHash", "recordCount", "archiveRootHash",
+  "previousCheckpointHash", "createdAt", "canonicalization", "hashAlgorithm",
+  "signaturePublicKeyFingerprint", "hash", "signature",
+]);
+const DISPOSITION_RECORD_KEYS = new Set([
+  "recordType", "schemaVersion", "dispositionId", "tenantId", "chainKind", "checkpointHash",
+  "fromSequence", "throughSequence", "archiveRootHash", "method", "policyReference", "disposedAt",
+  "canonicalization", "hashAlgorithm", "signaturePublicKeyFingerprint", "hash", "signature",
+]);
+const SIGNATURE_KEYS = new Set(["algorithm", "publicKeyFingerprint", "signature"]);
 
 export interface RetentionSignature {
   algorithm: "ed25519";
@@ -134,7 +146,7 @@ export function hashRetentionCheckpoint(
  * detached signature through a caller-injected trust boundary.
  */
 export function verifyRetentionCheckpoint(
-  checkpoint: RetentionCheckpoint,
+  checkpoint: unknown,
   options: RetentionVerificationOptions = {},
 ): RetentionVerificationResult {
   return verifyCheckpointAt(checkpoint, options, 0);
@@ -145,16 +157,18 @@ export function verifyRetentionCheckpoint(
  * exact range continuity, prior-tip linkage, and checkpoint-hash linkage.
  */
 export function verifyRetentionCheckpointChain(
-  checkpoints: readonly RetentionCheckpoint[],
+  checkpoints: readonly unknown[],
   options: RetentionVerificationOptions = {},
 ): RetentionVerificationResult {
   let signature: RetentionSignatureStatus = checkpoints.length === 0 ? "absent" : "valid";
-  for (const [index, checkpoint] of checkpoints.entries()) {
-    const verified = verifyCheckpointAt(checkpoint, options, index);
+  for (const [index, value] of checkpoints.entries()) {
+    const verified = verifyCheckpointAt(value, options, index);
     signature = combineSignatureStatus(signature, verified.signature);
     if (!verified.ok) return { ...verified, signature };
 
-    const previous = checkpoints[index - 1]!;
+    const checkpoint = value as RetentionCheckpoint;
+
+    const previous = checkpoints[index - 1] as RetentionCheckpoint;
     if (checkpoint.epoch !== index + 1) return failure(index, "epoch_mismatch", signature);
     if (index === 0) continue;
     if (checkpoint.tenantId !== previous.tenantId) return failure(index, "tenant_mismatch", signature);
@@ -177,17 +191,18 @@ export function verifyRetentionCheckpointChain(
  * weakening the existing genesis-only verifier or re-hashing retained records.
  */
 export function verifyAuditRecordsFromCheckpoint(
-  checkpoint: RetentionCheckpoint,
+  checkpoint: unknown,
   records: readonly AuditRecord[],
   options: RetentionVerificationOptions = {},
 ): RetentionVerificationResult {
   const checkpointResult = verifyRetentionCheckpoint(checkpoint, options);
   if (!checkpointResult.ok) return checkpointResult;
-  let sequence = checkpoint.throughSequence;
-  let previousHash = checkpoint.throughHash;
+  const anchor = checkpoint as RetentionCheckpoint;
+  let sequence = anchor.throughSequence;
+  let previousHash = anchor.throughHash;
   for (const [index, record] of records.entries()) {
     if (!record.event.scope?.tenantId) return failure(index, "missing_tenant_scope", checkpointResult.signature);
-    if (record.event.scope.tenantId !== checkpoint.tenantId) return failure(index, "tenant_mismatch", checkpointResult.signature);
+    if (record.event.scope.tenantId !== anchor.tenantId) return failure(index, "tenant_mismatch", checkpointResult.signature);
     if (record.hashAlgorithm !== RETENTION_HASH_ALGORITHM) {
       return failure(index, "unsupported_hash_algorithm", checkpointResult.signature);
     }
@@ -237,8 +252,8 @@ export function hashRetentionDisposition(
  * equality with the referenced checkpoint before accepting the disposal claim.
  */
 export function verifyRetentionDisposition(
-  disposition: RetentionDisposition,
-  checkpoint: RetentionCheckpoint,
+  disposition: unknown,
+  checkpoint: unknown,
   options: RetentionVerificationOptions = {},
 ): RetentionVerificationResult {
   const checkpointResult = verifyRetentionCheckpoint(checkpoint, {
@@ -246,32 +261,37 @@ export function verifyRetentionDisposition(
     ...(options.signatureVerifier ? { signatureVerifier: options.signatureVerifier } : {}),
   });
   if (!checkpointResult.ok) return checkpointResult;
+  const referencedCheckpoint = checkpoint as RetentionCheckpoint;
+  if (!isPlainObject(disposition) || !hasOnlyKeys(disposition, DISPOSITION_RECORD_KEYS)) {
+    return failure(0, "invalid_disposition", "absent");
+  }
+  const receipt = disposition as unknown as RetentionDisposition;
   if (
-    disposition.recordType !== "retention.disposition" ||
-    disposition.schemaVersion !== RETENTION_SCHEMA_VERSION ||
-    disposition.method !== "provider-delete" ||
-    disposition.canonicalization !== RETENTION_CANONICALIZATION ||
-    disposition.hashAlgorithm !== RETENTION_HASH_ALGORITHM
+    receipt.recordType !== "retention.disposition" ||
+    receipt.schemaVersion !== RETENTION_SCHEMA_VERSION ||
+    receipt.method !== "provider-delete" ||
+    receipt.canonicalization !== RETENTION_CANONICALIZATION ||
+    receipt.hashAlgorithm !== RETENTION_HASH_ALGORITHM
   ) {
     return failure(0, "unsupported_protocol", "absent");
   }
   try {
-    assertDispositionInput(disposition);
+    assertDispositionInput(receipt);
   } catch {
     return failure(0, "invalid_disposition", "absent");
   }
-  if (!HASH_PATTERN.test(disposition.hash) || disposition.hash !== hashRetentionDisposition(disposition)) {
+  if (!HASH_PATTERN.test(receipt.hash) || receipt.hash !== hashRetentionDisposition(receipt)) {
     return failure(0, "hash_mismatch", "absent");
   }
-  const signature = verifyDetachedSignature(disposition, options);
+  const signature = verifyDetachedSignature(receipt, options);
   if (signature.reason) return failure(0, signature.reason, signature.status);
   if (
-    disposition.tenantId !== checkpoint.tenantId ||
-    disposition.chainKind !== checkpoint.chainKind ||
-    disposition.checkpointHash !== checkpoint.hash ||
-    disposition.fromSequence !== checkpoint.fromSequence ||
-    disposition.throughSequence !== checkpoint.throughSequence ||
-    disposition.archiveRootHash !== checkpoint.archiveRootHash
+    receipt.tenantId !== referencedCheckpoint.tenantId ||
+    receipt.chainKind !== referencedCheckpoint.chainKind ||
+    receipt.checkpointHash !== referencedCheckpoint.hash ||
+    receipt.fromSequence !== referencedCheckpoint.fromSequence ||
+    receipt.throughSequence !== referencedCheckpoint.throughSequence ||
+    receipt.archiveRootHash !== referencedCheckpoint.archiveRootHash
   ) {
     return failure(0, "checkpoint_mismatch", signature.status);
   }
@@ -280,27 +300,31 @@ export function verifyRetentionDisposition(
 
 /** Applies shape, hash, and injected-signature gates at a stable result index. */
 function verifyCheckpointAt(
-  checkpoint: RetentionCheckpoint,
+  checkpoint: unknown,
   options: RetentionVerificationOptions,
   index: number,
 ): RetentionVerificationResult {
+  if (!isPlainObject(checkpoint) || !hasOnlyKeys(checkpoint, CHECKPOINT_RECORD_KEYS)) {
+    return failure(index, "invalid_checkpoint", "absent");
+  }
+  const candidate = checkpoint as unknown as RetentionCheckpoint;
   if (
-    checkpoint.recordType !== "retention.checkpoint" ||
-    checkpoint.schemaVersion !== RETENTION_SCHEMA_VERSION ||
-    checkpoint.canonicalization !== RETENTION_CANONICALIZATION ||
-    checkpoint.hashAlgorithm !== RETENTION_HASH_ALGORITHM
+    candidate.recordType !== "retention.checkpoint" ||
+    candidate.schemaVersion !== RETENTION_SCHEMA_VERSION ||
+    candidate.canonicalization !== RETENTION_CANONICALIZATION ||
+    candidate.hashAlgorithm !== RETENTION_HASH_ALGORITHM
   ) {
     return failure(index, "unsupported_protocol", "absent");
   }
   try {
-    assertCheckpointInput(checkpoint);
+    assertCheckpointInput(candidate);
   } catch {
     return failure(index, "invalid_checkpoint", "absent");
   }
-  if (!HASH_PATTERN.test(checkpoint.hash) || checkpoint.hash !== hashRetentionCheckpoint(checkpoint)) {
+  if (!HASH_PATTERN.test(candidate.hash) || candidate.hash !== hashRetentionCheckpoint(candidate)) {
     return failure(index, "hash_mismatch", "absent");
   }
-  const signature = verifyDetachedSignature(checkpoint, options);
+  const signature = verifyDetachedSignature(candidate, options);
   if (signature.reason) return failure(index, signature.reason, signature.status);
   return { ok: true, signature: signature.status };
 }
@@ -317,6 +341,9 @@ function verifyDetachedSignature(
   }
   if (!fingerprint || !signature || signature.publicKeyFingerprint !== fingerprint) {
     return { status: "invalid", reason: "signature_fingerprint_mismatch" };
+  }
+  if (!isPlainObject(signature) || !hasOnlyKeys(signature, SIGNATURE_KEYS)) {
+    return { status: "invalid", reason: "signature_invalid" };
   }
   if (signature.algorithm !== "ed25519" || !BASE64_SIGNATURE_PATTERN.test(signature.signature)) {
     return { status: "invalid", reason: "signature_invalid" };
@@ -501,6 +528,9 @@ function assertSignaturePair(fingerprint: string | undefined, signature: Retenti
   if (!signature) return;
   if (signature.algorithm !== "ed25519") throw new TypeError("signature algorithm must be ed25519");
   assertHash(signature.publicKeyFingerprint, "signature.publicKeyFingerprint");
+  if (signature.publicKeyFingerprint !== fingerprint) {
+    throw new TypeError("signature public key fingerprint must match the bound fingerprint");
+  }
   if (!BASE64_SIGNATURE_PATTERN.test(signature.signature)) throw new TypeError("signature must be padded base64");
 }
 
@@ -532,10 +562,21 @@ function assertTimestamp(value: unknown, field: string): asserts value is string
     typeof value !== "string" ||
     !TIMESTAMP_PATTERN.test(value) ||
     Number.isNaN(Date.parse(value)) ||
+    value.startsWith("0000-") ||
     new Date(value).toISOString() !== value
   ) {
     throw new TypeError(`${field} must be exact UTC milliseconds`);
   }
+}
+
+/** Narrows untrusted verifier inputs before any field access can throw. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Enforces schema-style additionalProperties false for runtime verification. */
+function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
 }
 
 /** Computes the bare lowercase SHA-256 digest used by portable retention records. */

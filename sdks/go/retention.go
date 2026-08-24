@@ -506,6 +506,9 @@ func assertRetentionSignaturePair(fingerprint string, signature *RetentionSignat
 	if signature.Algorithm != "ed25519" || !retentionHashPattern.MatchString(signature.PublicKeyFingerprint) || !retentionSignaturePattern.MatchString(signature.Signature) {
 		return errors.New("signature must use ed25519, lowercase fingerprint, and padded base64")
 	}
+	if signature.PublicKeyFingerprint != fingerprint {
+		return errors.New("signature public key fingerprint must match the bound fingerprint")
+	}
 	return nil
 }
 
@@ -524,8 +527,8 @@ func retentionExactTimestamp(value string) bool {
 	if !retentionTimestampPattern.MatchString(value) {
 		return false
 	}
-	_, err := time.Parse("2006-01-02T15:04:05.000Z", value)
-	return err == nil
+	parsed, err := time.Parse("2006-01-02T15:04:05.000Z", value)
+	return err == nil && parsed.Year() >= 1
 }
 
 /* retentionCheckpointAsInput strips computed protocol fields for shape validation. */

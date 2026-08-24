@@ -72,12 +72,20 @@ func TestRetentionChainAndAnchoredTail(t *testing.T) {
 	}
 }
 
-func TestRetentionSignatureFingerprintMismatch(t *testing.T) {
+func TestRetentionSignatureConstructorMismatchAndRecordMutation(t *testing.T) {
 	data := loadFixture(t, "retention-checkpoints.json")
 	entry := mapValue(t, retentionArrayValue(t, data["cases"])[1])
+	for _, raw := range retentionArrayValue(t, data["signatureConstructorRejections"]) {
+		rejection := mapValue(t, raw)
+		signature := decodeValue[RetentionSignature](t, entry["signature"])
+		signature.PublicKeyFingerprint = stringValue(t, rejection["publicKeyFingerprint"])
+		if _, err := CreateRetentionCheckpoint(decodeValue[RetentionCheckpointInput](t, entry["input"]), &signature); err == nil {
+			t.Fatalf("expected signature constructor rejection for %s", stringValue(t, rejection["name"]))
+		}
+	}
 	signature := decodeValue[RetentionSignature](t, entry["signature"])
-	signature.PublicKeyFingerprint = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	checkpoint, _ := CreateRetentionCheckpoint(decodeValue[RetentionCheckpointInput](t, entry["input"]), &signature)
+	checkpoint.Signature.PublicKeyFingerprint = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	if result := VerifyRetentionCheckpoint(checkpoint, nil); result.Reason != "signature_fingerprint_mismatch" {
 		t.Fatalf("expected fingerprint mismatch, got %#v", result)
 	}
@@ -112,6 +120,14 @@ func TestRetentionDispositionFixtureAndMismatch(t *testing.T) {
 	disposition, err := CreateRetentionDisposition(decodeValue[RetentionDispositionInput](t, entry["input"]), &signature)
 	if err != nil || disposition.Hash != stringValue(t, entry["expectedHash"]) {
 		t.Fatalf("disposition fixture mismatch: %v", err)
+	}
+	for _, raw := range retentionArrayValue(t, dispositions["signatureConstructorRejections"]) {
+		rejection := mapValue(t, raw)
+		mismatchedSignature := signature
+		mismatchedSignature.PublicKeyFingerprint = stringValue(t, rejection["publicKeyFingerprint"])
+		if _, err := CreateRetentionDisposition(decodeValue[RetentionDispositionInput](t, entry["input"]), &mismatchedSignature); err == nil {
+			t.Fatalf("expected disposition signature constructor rejection for %s", stringValue(t, rejection["name"]))
+		}
 	}
 	for _, raw := range retentionArrayValue(t, dispositions["mismatchRejections"]) {
 		rejection := mapValue(t, raw)

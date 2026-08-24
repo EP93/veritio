@@ -31,6 +31,16 @@ function ed25519Verifier(publicKey: Uint8Array, signature: Uint8Array, message: 
 }
 
 describe("retention checkpoint protocol", () => {
+  test("schemas require calendar-valid UTC milliseconds and reject year zero", async () => {
+    for (const fileName of ["retention-checkpoint.schema.json", "retention-disposition.schema.json"]) {
+      const schema = (await Bun.file(join(import.meta.dir, `../../../../spec/${fileName}`)).json()) as {
+        $defs: { timestamp: { format?: string; pattern: string } };
+      };
+      expect(schema.$defs.timestamp.format).toBe("date-time");
+      expect(new RegExp(schema.$defs.timestamp.pattern).test("0000-01-01T00:00:00.000Z")).toBeFalse();
+    }
+  });
+
   test("matches literal checkpoint hashes and detached signature fixture", async () => {
     const data = await fixture<any>("retention-checkpoints.json");
     const unsigned = createRetentionCheckpoint(data.cases[0].input);
@@ -88,14 +98,41 @@ describe("retention checkpoint protocol", () => {
     ).toEqual({ ok: true, signature: "valid" });
   });
 
-  test("rejects a signature fingerprint not bound into the checkpoint hash", async () => {
+  test("constructors reject a mismatched signature fingerprint and verifiers reject record mutation", async () => {
     const data = await fixture<any>("retention-checkpoints.json");
-    const signed = createRetentionCheckpoint(data.cases[1].input, {
-      ...data.cases[1].signature,
-      publicKeyFingerprint: "f".repeat(64),
-    });
+    for (const rejection of data.signatureConstructorRejections) {
+      expect(() =>
+        createRetentionCheckpoint(data.cases[1].input, {
+          ...data.cases[1].signature,
+          publicKeyFingerprint: rejection.publicKeyFingerprint,
+        }),
+      ).toThrow();
+    }
 
-    expect(verifyRetentionCheckpoint(signed).reason).toBe("signature_fingerprint_mismatch");
+    const signed = createRetentionCheckpoint(data.cases[1].input, data.cases[1].signature);
+    const mutated = {
+      ...signed,
+      signature: { ...signed.signature!, publicKeyFingerprint: "f".repeat(64) },
+    };
+
+    expect(verifyRetentionCheckpoint(mutated).reason).toBe("signature_fingerprint_mismatch");
+  });
+
+  test("checkpoint verification fails closed on non-objects and unknown fields", async () => {
+    const data = await fixture<any>("retention-checkpoints.json");
+    const unsigned = createRetentionCheckpoint(data.cases[0].input);
+    const signed = createRetentionCheckpoint(data.cases[1].input, data.cases[1].signature);
+
+    expect(verifyRetentionCheckpoint(null)).toEqual({
+      ok: false,
+      index: 0,
+      reason: "invalid_checkpoint",
+      signature: "absent",
+    });
+    expect(verifyRetentionCheckpoint({ ...unsigned, unexpected: true }).reason).toBe("invalid_checkpoint");
+    expect(
+      verifyRetentionCheckpoint({ ...signed, signature: { ...signed.signature!, unexpected: true } }).reason,
+    ).toBe("signature_invalid");
   });
 
   test("verifies a retained audit tail from the checkpoint anchor", async () => {
@@ -142,5 +179,30 @@ describe("retention disposition protocol", () => {
       const disposition = createRetentionDisposition({ ...baseInput, [rejection.field]: rejection.value });
       expect(verifyRetentionDisposition(disposition, checkpoint).reason).toBe("checkpoint_mismatch");
     }
+  });
+
+  test("rejects mismatched signature construction and malformed receipt shapes", async () => {
+    const checkpoints = await fixture<any>("retention-checkpoints.json");
+    const data = await fixture<any>("retention-dispositions.json");
+    const checkpoint = createRetentionCheckpoint(checkpoints.cases[0].input);
+
+    for (const rejection of data.signatureConstructorRejections) {
+      expect(() =>
+        createRetentionDisposition(data.cases[0].input, {
+          ...data.cases[0].signature,
+          publicKeyFingerprint: rejection.publicKeyFingerprint,
+        }),
+      ).toThrow();
+    }
+
+    const signed = createRetentionDisposition(data.cases[0].input, data.cases[0].signature);
+    expect(verifyRetentionDisposition(null, checkpoint).reason).toBe("invalid_disposition");
+    expect(verifyRetentionDisposition({ ...signed, unexpected: true }, checkpoint).reason).toBe("invalid_disposition");
+    expect(
+      verifyRetentionDisposition(
+        { ...signed, signature: { ...signed.signature!, unexpected: true } },
+        checkpoint,
+      ).reason,
+    ).toBe("signature_invalid");
   });
 });

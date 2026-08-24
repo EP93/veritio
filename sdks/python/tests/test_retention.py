@@ -66,11 +66,31 @@ class RetentionTests(unittest.TestCase):
             {"ok": True, "signature": "absent"},
         )
 
-    def test_signature_fingerprint_mismatch_is_rejected(self):
+    def test_signature_constructor_mismatch_and_record_mutation_are_rejected(self):
         data = fixture("retention-checkpoints.json")
-        signature = {**data["cases"][1]["signature"], "publicKeyFingerprint": "f" * 64}
-        signed = create_retention_checkpoint(data["cases"][1]["input"], signature)
-        self.assertEqual(verify_retention_checkpoint(signed)["reason"], "signature_fingerprint_mismatch")
+        for rejection in data["signatureConstructorRejections"]:
+            with self.subTest(rejection["name"]), self.assertRaises(TypeError):
+                create_retention_checkpoint(
+                    data["cases"][1]["input"],
+                    {**data["cases"][1]["signature"], "publicKeyFingerprint": rejection["publicKeyFingerprint"]},
+                )
+        signed = create_retention_checkpoint(data["cases"][1]["input"], data["cases"][1]["signature"])
+        mutated = {**signed, "signature": {**signed["signature"], "publicKeyFingerprint": "f" * 64}}
+        self.assertEqual(verify_retention_checkpoint(mutated)["reason"], "signature_fingerprint_mismatch")
+
+    def test_checkpoint_verification_rejects_non_objects_and_unknown_fields(self):
+        data = fixture("retention-checkpoints.json")
+        unsigned = create_retention_checkpoint(data["cases"][0]["input"])
+        signed = create_retention_checkpoint(data["cases"][1]["input"], data["cases"][1]["signature"])
+        self.assertEqual(
+            verify_retention_checkpoint(None),
+            {"ok": False, "index": 0, "reason": "invalid_checkpoint", "signature": "absent"},
+        )
+        self.assertEqual(verify_retention_checkpoint({**unsigned, "unexpected": True})["reason"], "invalid_checkpoint")
+        self.assertEqual(
+            verify_retention_checkpoint({**signed, "signature": {**signed["signature"], "unexpected": True}})["reason"],
+            "signature_invalid",
+        )
 
     def test_all_signed_checkpoint_chain_reports_valid(self):
         data = fixture("retention-checkpoints.json")
@@ -101,6 +121,29 @@ class RetentionTests(unittest.TestCase):
             base_input = {key: value for key, value in data["cases"][0]["input"].items() if key != "signaturePublicKeyFingerprint"}
             mismatched = create_retention_disposition({**base_input, rejection["field"]: rejection["value"]})
             self.assertEqual(verify_retention_disposition(mismatched, checkpoint)["reason"], "checkpoint_mismatch")
+
+    def test_disposition_rejects_signature_mismatch_and_malformed_shapes(self):
+        checkpoints = fixture("retention-checkpoints.json")
+        data = fixture("retention-dispositions.json")
+        checkpoint = create_retention_checkpoint(checkpoints["cases"][0]["input"])
+        for rejection in data["signatureConstructorRejections"]:
+            with self.subTest(rejection["name"]), self.assertRaises(TypeError):
+                create_retention_disposition(
+                    data["cases"][0]["input"],
+                    {**data["cases"][0]["signature"], "publicKeyFingerprint": rejection["publicKeyFingerprint"]},
+                )
+        signed = create_retention_disposition(data["cases"][0]["input"], data["cases"][0]["signature"])
+        self.assertEqual(verify_retention_disposition(None, checkpoint)["reason"], "invalid_disposition")
+        self.assertEqual(
+            verify_retention_disposition({**signed, "unexpected": True}, checkpoint)["reason"],
+            "invalid_disposition",
+        )
+        self.assertEqual(
+            verify_retention_disposition(
+                {**signed, "signature": {**signed["signature"], "unexpected": True}}, checkpoint
+            )["reason"],
+            "signature_invalid",
+        )
 
 
 if __name__ == "__main__":
