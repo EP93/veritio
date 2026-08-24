@@ -87,7 +87,7 @@ export interface RunRetentionEpochOptions {
 
 /** Detached coordinator result; authoritative records remain owned by the injected store. */
 export interface RunRetentionEpochResult {
-  manifest: RetentionStagingManifest;
+  manifest: RetentionStagingManifest | null;
   checkpoint: RetentionCheckpoint;
   disposition: RetentionDisposition;
 }
@@ -117,39 +117,55 @@ async function runRetentionEpochUnderLease(
 ): Promise<RunRetentionEpochResult> {
   validateCoordinatorInputs(options);
   const epoch = (options.previousCheckpoint?.epoch ?? 0) + 1;
-  const epochInput = {
-    tenantId: options.tenantId,
-    epoch,
-    previousCheckpoint: options.previousCheckpoint,
-    records: options.records,
-    ...(options.segmentRecordCount === undefined ? {} : { segmentRecordCount: options.segmentRecordCount }),
-  };
-  const manifest = options.archive.deriveEpoch(epochInput);
-
-  const checkpointInput: RetentionCheckpointInput = {
-    checkpointId: options.checkpoint.checkpointId,
-    tenantId: options.tenantId,
-    chainKind: "audit",
-    epoch,
-    fromSequence: manifest.fromSequence,
-    fromPreviousHash: manifest.fromPreviousHash,
-    throughSequence: manifest.throughSequence,
-    throughHash: manifest.throughHash,
-    recordCount: manifest.recordCount,
-    archiveRootHash: manifest.archiveRootHash,
-    previousCheckpointHash: options.previousCheckpoint?.hash ?? null,
-    createdAt: options.checkpoint.createdAt,
-  };
-  const checkpoint = options.createCheckpoint(checkpointInput);
-  assertCheckpointFactoryBinding(checkpoint, checkpointInput);
-  assertVerifiedCheckpoint(checkpoint, options.verification);
-
   const preflightCheckpoints = await options.store.listCheckpoints({ tenantId: options.tenantId });
-  const preflightCheckpoint = preflightCheckpoints.find((candidate) => candidate.epoch === checkpoint.epoch);
-  if (preflightCheckpoint && canonicalJson(preflightCheckpoint) !== canonicalJson(checkpoint)) {
-    throw new TypeError("retention checkpoint replay conflict");
+  const preflightDispositions = await options.store.listDispositions({ tenantId: options.tenantId });
+  const preflightCheckpoint = preflightCheckpoints.find((candidate) => candidate.epoch === epoch);
+
+  let manifest: RetentionStagingManifest | null;
+  let checkpoint: RetentionCheckpoint;
+  let epochInput: Parameters<RetentionStagingArchive["deriveEpoch"]>[0] | null = null;
+  if (preflightCheckpoint) {
+    assertVerifiedCheckpoint(preflightCheckpoint, options.verification);
+    assertStoredCheckpointAnchor(preflightCheckpoint, options.previousCheckpoint, epoch, options.tenantId);
+    const replayInput = checkpointInputFromStored(options, preflightCheckpoint);
+    const replayedCheckpoint = options.createCheckpoint(replayInput);
+    assertCheckpointFactoryBinding(replayedCheckpoint, replayInput);
+    assertVerifiedCheckpoint(replayedCheckpoint, options.verification);
+    if (canonicalJson(preflightCheckpoint) !== canonicalJson(replayedCheckpoint)) {
+      throw new TypeError("retention checkpoint replay conflict");
+    }
+    checkpoint = preflightCheckpoint;
+    manifest = await options.archive.recoverEpoch(checkpoint);
+  } else {
+    if (options.records.length === 0) throw new TypeError("retention epoch requires at least one record");
+    epochInput = {
+      tenantId: options.tenantId,
+      epoch,
+      previousCheckpoint: options.previousCheckpoint,
+      records: options.records,
+      ...(options.segmentRecordCount === undefined ? {} : { segmentRecordCount: options.segmentRecordCount }),
+    };
+    manifest = options.archive.deriveEpoch(epochInput);
+    const checkpointInput: RetentionCheckpointInput = {
+      checkpointId: options.checkpoint.checkpointId,
+      tenantId: options.tenantId,
+      chainKind: "audit",
+      epoch,
+      fromSequence: manifest.fromSequence,
+      fromPreviousHash: manifest.fromPreviousHash,
+      throughSequence: manifest.throughSequence,
+      throughHash: manifest.throughHash,
+      recordCount: manifest.recordCount,
+      archiveRootHash: manifest.archiveRootHash,
+      previousCheckpointHash: options.previousCheckpoint?.hash ?? null,
+      createdAt: options.checkpoint.createdAt,
+    };
+    checkpoint = options.createCheckpoint(checkpointInput);
+    assertCheckpointFactoryBinding(checkpoint, checkpointInput);
+    assertVerifiedCheckpoint(checkpoint, options.verification);
   }
-  const preflightDisposition = (await options.store.listDispositions({ tenantId: options.tenantId })).find(
+
+  const preflightDisposition = preflightDispositions.find(
     (candidate) => candidate.checkpointHash === checkpoint.hash,
   );
   if (preflightDisposition) {
@@ -158,17 +174,18 @@ async function runRetentionEpochUnderLease(
     if (canonicalJson(preflightDisposition) !== canonicalJson(expectedReceipt)) {
       throw new TypeError("retention disposition replay conflict");
     }
-    if (!(await options.archive.confirmEpochAbsent(manifest))) {
+    if (!(await options.archive.confirmCheckpointEpochAbsent(checkpoint))) {
       throw new TypeError("staged retention epoch is present after confirmed disposition");
     }
     return {
-      manifest: cloneManifest(manifest),
+      manifest: cloneOptionalManifest(manifest),
       checkpoint: cloneCheckpoint(checkpoint),
       disposition: cloneDisposition(preflightDisposition),
     };
   }
 
   if (!preflightCheckpoint) {
+    if (!epochInput || !manifest) throw new TypeError("retention epoch derivation is unavailable");
     const sealedManifest = await options.archive.sealEpoch(epochInput);
     if (canonicalJson(sealedManifest) !== canonicalJson(manifest)) {
       throw new TypeError("staged retention manifest derivation mismatch");
@@ -223,7 +240,7 @@ async function runRetentionEpochUnderLease(
       if (canonicalJson(accepted) !== canonicalJson(expectedReceipt)) {
         throw new TypeError("retention disposition replay conflict");
       }
-      if (!(await options.archive.confirmEpochAbsent(manifest))) {
+      if (!(await options.archive.confirmCheckpointEpochAbsent(checkpoint))) {
         throw new TypeError("staged retention epoch is present after confirmed disposition");
       }
       return accepted;
@@ -249,8 +266,13 @@ async function runRetentionEpochUnderLease(
       throw new TypeError("prepared disposition attempt binding mismatch");
     }
 
-    await options.archive.deleteEpoch(manifest);
-    if (!(await options.archive.confirmEpochAbsent(manifest))) {
+    if (manifest) {
+      await options.archive.deleteEpoch(manifest);
+    }
+    const deletionConfirmed = manifest
+      ? await options.archive.confirmEpochAbsent(manifest)
+      : await options.archive.confirmCheckpointEpochAbsent(checkpoint);
+    if (!deletionConfirmed) {
       throw new TypeError("staged retention epoch deletion is unconfirmed");
     }
     const receipt = createAndVerifyDisposition(options, checkpoint);
@@ -264,7 +286,7 @@ async function runRetentionEpochUnderLease(
   });
 
   return {
-    manifest: cloneManifest(manifest),
+    manifest: cloneOptionalManifest(manifest),
     checkpoint: cloneCheckpoint(checkpoint),
     disposition: cloneDisposition(disposition),
   };
@@ -302,9 +324,70 @@ function validateCoordinatorInputs(options: RunRetentionEpochOptions): void {
   assertId(options.checkpoint.checkpointId, "checkpointId");
   assertId(options.disposition.attemptId, "attemptId");
   assertId(options.disposition.dispositionId, "dispositionId");
-  if (options.records.length === 0) throw new TypeError("retention epoch requires at least one record");
   if (options.previousCheckpoint !== null && options.previousCheckpoint.tenantId !== options.tenantId) {
     throw new TypeError("previous checkpoint tenant mismatch");
+  }
+}
+
+/**
+ * Reconstructs the caller-owned factory input from an authoritative stored
+ * checkpoint so cold recovery can enforce byte-identical identity/signature
+ * replay without any disposed event bodies.
+ */
+function checkpointInputFromStored(
+  options: RunRetentionEpochOptions,
+  stored: RetentionCheckpoint,
+): RetentionCheckpointInput {
+  return {
+    checkpointId: options.checkpoint.checkpointId,
+    tenantId: stored.tenantId,
+    chainKind: stored.chainKind,
+    epoch: stored.epoch,
+    fromSequence: stored.fromSequence,
+    fromPreviousHash: stored.fromPreviousHash,
+    throughSequence: stored.throughSequence,
+    throughHash: stored.throughHash,
+    recordCount: stored.recordCount,
+    archiveRootHash: stored.archiveRootHash,
+    previousCheckpointHash: stored.previousCheckpointHash,
+    createdAt: options.checkpoint.createdAt,
+  };
+}
+
+/**
+ * Validates that a stored cold-recovery checkpoint is the exact next epoch for
+ * the caller's explicit genesis/prior-checkpoint anchor before provider lookup.
+ */
+function assertStoredCheckpointAnchor(
+  checkpoint: RetentionCheckpoint,
+  previousCheckpoint: RetentionCheckpoint | null,
+  expectedEpoch: number,
+  tenantId: string,
+): void {
+  if (checkpoint.tenantId !== tenantId || checkpoint.chainKind !== "audit" || checkpoint.epoch !== expectedEpoch) {
+    throw new TypeError("stored retention checkpoint scope or epoch mismatch");
+  }
+  if (previousCheckpoint === null) {
+    if (
+      checkpoint.epoch !== 1 ||
+      checkpoint.previousCheckpointHash !== null ||
+      checkpoint.fromSequence !== 1 ||
+      checkpoint.fromPreviousHash !== null
+    ) {
+      throw new TypeError("stored retention checkpoint does not extend genesis");
+    }
+    return;
+  }
+  const previousVerification = verifyRetentionCheckpoint(previousCheckpoint);
+  if (!previousVerification.ok) throw new TypeError(`invalid previous checkpoint: ${previousVerification.reason}`);
+  if (
+    previousCheckpoint.tenantId !== tenantId ||
+    checkpoint.epoch !== previousCheckpoint.epoch + 1 ||
+    checkpoint.previousCheckpointHash !== previousCheckpoint.hash ||
+    checkpoint.fromSequence !== previousCheckpoint.throughSequence + 1 ||
+    checkpoint.fromPreviousHash !== previousCheckpoint.throughHash
+  ) {
+    throw new TypeError("stored retention checkpoint does not extend prior checkpoint");
   }
 }
 
@@ -365,6 +448,11 @@ function cloneChainState(state: AuditChainState): AuditChainState {
 /** Clones physical segment lookups before returning a derived manifest to the host. */
 function cloneManifest(manifest: RetentionStagingManifest): RetentionStagingManifest {
   return { ...manifest, segments: manifest.segments.map((segment) => ({ ...segment })) };
+}
+
+/** Preserves explicit post-delete absence while detaching any recovered manifest keys. */
+function cloneOptionalManifest(manifest: RetentionStagingManifest | null): RetentionStagingManifest | null {
+  return manifest === null ? null : cloneManifest(manifest);
 }
 
 /** Clones optional detached checkpoint signature fields without retaining mutable references. */

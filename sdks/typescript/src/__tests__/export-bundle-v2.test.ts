@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { join } from "node:path";
 import {
   buildExportBundleV2,
   canonicalJson,
   computeRootHash,
+  createRetentionCheckpoint,
+  createRetentionDisposition,
   type ExportBundleV2,
   hashAuditRecord,
   hashEvidenceEdgeRecord,
@@ -31,6 +33,13 @@ async function fixture(name: string): Promise<any> {
 /** Deep-clones untrusted fixture data before a negative test mutates it. */
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Verifies Ed25519 retention signatures from the protocol's raw 32-byte public key form. */
+function ed25519Verifier(publicKey: Uint8Array, signature: Uint8Array, message: Uint8Array): boolean {
+  const spkiPrefix = Buffer.from("302a300506032b6570032100", "hex");
+  const key = createPublicKey({ key: Buffer.concat([spkiPrefix, publicKey]), format: "der", type: "spki" });
+  return verify(null, message, key, signature);
 }
 
 /** Parses one canonical JSONL file into record objects for builder tests. */
@@ -233,6 +242,71 @@ describe("vevb-2 checkpoint-aware export", () => {
     await expect(buildExportBundleV2({ ...input, auditOrigin: undefined as never })).rejects.toThrow();
     await expect(buildExportBundleV2({ ...input, checkpoints: input.checkpoints.slice(1) })).rejects.toThrow();
     await expect(buildExportBundleV2({ ...input, commits: [{}] })).rejects.toThrow();
+  });
+
+  test("round-trips signed checkpoint and disposition claims under caller-trusted retention keys", async () => {
+    const base = (await fixture("export-bundle-v2-golden.json")).bundle as ExportBundleV2;
+    const checkpointFixture = await fixture("retention-checkpoints.json");
+    const dispositionFixture = await fixture("retention-dispositions.json");
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const publicKeyDer = publicKey.export({ format: "der", type: "spki" });
+    const trustedPublicKey = Uint8Array.from(publicKeyDer.subarray(-32));
+    const fingerprint = createHash("sha256").update(trustedPublicKey).digest("hex");
+    const signatureShell = {
+      algorithm: "ed25519" as const,
+      publicKeyFingerprint: fingerprint,
+      signature: Buffer.alloc(64).toString("base64"),
+    };
+    const checkpointInput = {
+      ...checkpointFixture.cases[0].input,
+      signaturePublicKeyFingerprint: fingerprint,
+    };
+    const checkpointToSign = createRetentionCheckpoint(checkpointInput, signatureShell);
+    const checkpoint = createRetentionCheckpoint(checkpointInput, {
+      ...signatureShell,
+      signature: sign(null, Buffer.from(checkpointToSign.hash), privateKey).toString("base64"),
+    });
+    const dispositionInput = {
+      ...dispositionFixture.cases[0].input,
+      checkpointHash: checkpoint.hash,
+      fromSequence: checkpoint.fromSequence,
+      throughSequence: checkpoint.throughSequence,
+      archiveRootHash: checkpoint.archiveRootHash,
+      signaturePublicKeyFingerprint: fingerprint,
+    };
+    const dispositionToSign = createRetentionDisposition(dispositionInput, signatureShell);
+    const disposition = createRetentionDisposition(dispositionInput, {
+      ...signatureShell,
+      signature: sign(null, Buffer.from(dispositionToSign.hash), privateKey).toString("base64"),
+    });
+    const bundle = await buildExportBundleV2({
+      scope: base.manifest.scope,
+      range: base.manifest.range,
+      producer: base.manifest.producer,
+      createdAt: base.manifest.createdAt,
+      auditOrigin: { kind: "checkpoint", checkpointHash: checkpoint.hash },
+      events: checkpointFixture.retainedRecords,
+      edges: records(base, "records/evidence-edges.jsonl"),
+      commits: [],
+      checkpoints: [checkpoint],
+      dispositions: [disposition],
+    });
+    const trusted = await verifyExportBundle(bundle, {
+      retention: { trustedPublicKey, signatureVerifier: ed25519Verifier, requireSignature: true },
+    });
+
+    expect(trusted.valid).toBe(true);
+    expect(trusted.retentionSignatures).toEqual({ checkpoints: "valid", dispositions: "valid" });
+
+    const mismatched = await verifyExportBundle(bundle, {
+      retention: { trustedPublicKey: new Uint8Array(32), signatureVerifier: ed25519Verifier, requireSignature: true },
+    });
+    expect(mismatched.valid).toBe(false);
+    expect(mismatched.retentionSignatures).toEqual({ checkpoints: "invalid", dispositions: "invalid" });
+
+    const unknown = await verifyExportBundle(bundle, { retention: { requireSignature: true } });
+    expect(unknown.valid).toBe(false);
+    expect(unknown.retentionSignatures).toEqual({ checkpoints: "skipped", dispositions: "skipped" });
   });
 
   test("fails closed on checkpoint, disposition, audit-tail, edge, commit, and manifest tampering", async () => {

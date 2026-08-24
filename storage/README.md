@@ -32,6 +32,14 @@ prefix, and preserves the minimum idempotency ledger needed to reject a
 post-crop duplicate. `MemoryAuditStore` in `@veritio/core` implements the same
 contract for tests, not as production durability.
 
+`AuditChainState` is relational, not merely a set of typed columns. The tip
+sequence is zero exactly when its hash is null; a positive tip requires a valid
+hash. `minimumRetainedSequence` is in `1..authoritativeTipSequence + 1` and is
+one exactly when `latestCheckpointHash` is null; a later minimum requires a
+valid latest-checkpoint hash. `@veritio/core`'s `assertAuditChainState`
+validates host expected state, and every capable adapter applies the same
+validator to persisted state before append or crop mutation.
+
 Before activating retention on an existing authoritative database, apply the
 additive schema constant (`POSTGRES_AUDIT_RECORDS_SCHEMA_SQL` or
 `MYSQL_AUDIT_RECORDS_SCHEMA_SQL`) before any checkpoint/crop call. Its SQL
@@ -98,6 +106,16 @@ second remains held through provider deletion, direct-read plus prefix-list
 absence confirmation, and receipt confirmation. The helpers read no
 environment, credentials, clock, or legal-hold state; hosts supply those
 boundaries and must re-evaluate eligibility/version on every retry.
+
+Cold retries inspect authoritative checkpoints and accepted dispositions before
+deriving anything from audit records. When a stored checkpoint has no receipt,
+the coordinator loads the deterministic epoch manifest and validates its full
+checkpoint binding before deleting its exact keys. If deletion already removed
+the manifest, confirmation requires both a direct manifest GET miss and an
+empty LIST of the complete deterministic epoch prefix; a missing manifest alone
+is insufficient. A retry with neither a stored checkpoint nor record bodies
+fails closed. `RunRetentionEpochResult.manifest` is `null` only when recovery
+confirmed a manifestless post-delete epoch from that checkpoint prefix.
 
 R2/S3 (and MinIO-compatible clients) are never authoritative: they cannot own
 sequences, idempotency, verification, DSAR answers, or a restore path. A

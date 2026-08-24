@@ -103,9 +103,19 @@ starts at sequence 1 under the existing full verifier.
 `verification.json` is canonical JSON with exact `checkpoints`, `dispositions`,
 `audit`, `edges`, and `commits` verdicts. Checkpoint and disposition verdicts
 also report the aggregate signature status: `valid`, `invalid`, `skipped`, or
-`absent`. An offline verifier recomputes every verdict and requires exact
-agreement with the embedded report. CLI and server summaries expose only these
-verdicts and static issue strings; they do not print raw event bodies.
+`absent`. These embedded verdicts are a trust-independent baseline: a
+well-formed signed record is `skipped` when no caller key is applied. An offline
+verifier recomputes that same baseline and requires exact agreement with the
+embedded report.
+
+Caller-injected retention trust is evaluated separately. The TypeScript v2
+report exposes aggregate caller-trusted outcomes as
+`retentionSignatures.checkpoints` and `retentionSignatures.dispositions`, and
+uses the trusted semantic verdicts for the overall result. Requiring a
+signature without a trusted key, or supplying a key whose fingerprint does not
+match, fails closed without turning an otherwise authentic embedded baseline
+into a mismatch. CLI and server summaries expose only verdicts and static issue
+strings; they do not print raw event bodies.
 
 A valid bundle supports a tamper-evident continuity claim from its declared
 origin. A checkpoint or disposition is not proof that every provider replica,

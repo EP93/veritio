@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  assertAuditChainState,
   type AuditChainState,
   type AuditEvent,
   type AuditRecord,
@@ -1831,23 +1832,6 @@ function parseJsonObject(value: string, label: string): Record<string, unknown> 
   }
   if (!isRecordObject(parsed)) throw new TypeError(`${label} is not an object`);
   return parsed;
-}
-
-/** Validates the complete authoritative chain-state CAS shape. */
-function assertAuditChainState(state: AuditChainState): void {
-  if (
-    !isRecordObject(state) ||
-    !Number.isSafeInteger(state.authoritativeTipSequence) ||
-    state.authoritativeTipSequence < 0 ||
-    !Number.isSafeInteger(state.minimumRetainedSequence) ||
-    state.minimumRetainedSequence < 1 ||
-    state.minimumRetainedSequence > state.authoritativeTipSequence + 1 ||
-    (state.authoritativeTipHash !== null && !isSha256Hex(state.authoritativeTipHash)) ||
-    (state.latestCheckpointHash !== null && !isSha256Hex(state.latestCheckpointHash))
-  ) {
-    throw new TypeError("invalid audit chain state");
-  }
-  assertRetentionPolicyFence(state.retentionPolicyFence);
 }
 
 /** Compares every persisted crop boundary so partial caller state never satisfies CAS. */

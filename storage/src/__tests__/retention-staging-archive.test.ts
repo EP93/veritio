@@ -269,6 +269,72 @@ describe("retention staging archive", () => {
     expect((await archive.verifyEpoch(manifest)).ok).toBe(false);
   });
 
+  test("recovers a stored manifest only when its deterministic prefix and fields bind the checkpoint", async () => {
+    const chain = records(3);
+    const client = createMemoryRetentionClient();
+    const archive = createRetentionStagingArchive({ client, prefix: "recovery-staging" });
+    const previousCheckpoint = firstCheckpoint(chain);
+    const manifest = await archive.sealEpoch({
+      tenantId: TENANT_ID,
+      epoch: 2,
+      previousCheckpoint,
+      records: chain.slice(2),
+    });
+    const checkpoint = createRetentionCheckpoint({
+      checkpointId: "rcp_recovery_2",
+      tenantId: manifest.tenantId,
+      chainKind: "audit",
+      epoch: manifest.epoch,
+      fromSequence: manifest.fromSequence,
+      fromPreviousHash: manifest.fromPreviousHash,
+      throughSequence: manifest.throughSequence,
+      throughHash: manifest.throughHash,
+      recordCount: manifest.recordCount,
+      archiveRootHash: manifest.archiveRootHash,
+      previousCheckpointHash: manifest.previousCheckpointHash,
+      createdAt: "2026-08-24T00:02:00.000Z",
+    });
+
+    expect(await archive.recoverEpoch(checkpoint)).toEqual(manifest);
+
+    const mismatched = createRetentionCheckpoint({ ...checkpoint, archiveRootHash: "f".repeat(64) });
+    await expect(archive.recoverEpoch(mismatched)).rejects.toThrow("staged epoch manifest checkpoint mismatch");
+  });
+
+  test("confirms a deleted manifest only from deterministic GET plus prefix-wide LIST absence", async () => {
+    const chain = records(3);
+    const client = createMemoryRetentionClient();
+    const archive = createRetentionStagingArchive({ client, prefix: "absence-staging" });
+    const previousCheckpoint = firstCheckpoint(chain);
+    const manifest = await archive.sealEpoch({
+      tenantId: TENANT_ID,
+      epoch: 2,
+      previousCheckpoint,
+      records: chain.slice(2),
+    });
+    const checkpoint = createRetentionCheckpoint({
+      checkpointId: "rcp_absence_2",
+      tenantId: manifest.tenantId,
+      chainKind: "audit",
+      epoch: manifest.epoch,
+      fromSequence: manifest.fromSequence,
+      fromPreviousHash: manifest.fromPreviousHash,
+      throughSequence: manifest.throughSequence,
+      throughHash: manifest.throughHash,
+      recordCount: manifest.recordCount,
+      archiveRootHash: manifest.archiveRootHash,
+      previousCheckpointHash: manifest.previousCheckpointHash,
+      createdAt: "2026-08-24T00:03:00.000Z",
+    });
+    await archive.deleteEpoch(manifest);
+
+    expect(await archive.recoverEpoch(checkpoint)).toBeNull();
+    client.objects.set(`${manifest.manifestKey}.ghost`, new TextEncoder().encode("listed-only"));
+    expect(await archive.confirmCheckpointEpochAbsent(checkpoint)).toBe(false);
+    client.objects.delete(`${manifest.manifestKey}.ghost`);
+    expect(await archive.confirmCheckpointEpochAbsent(checkpoint)).toBe(true);
+  });
+
   test("rejects mutated physical keys and non-contiguous descriptors before provider access", async () => {
     const chain = records(4);
     const client = createMemoryRetentionClient();

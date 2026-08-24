@@ -1077,13 +1077,15 @@ export class MemoryAuditStore implements CheckpointingAuditStore {
    * tenant genesis state without persisting unnecessary empty tenant entries.
    */
   #chainState(tenantId: string): AuditChainState {
-    return this.#tenantChainStates.get(tenantId) ?? {
+    const state = this.#tenantChainStates.get(tenantId) ?? {
       authoritativeTipSequence: 0,
       authoritativeTipHash: null,
       minimumRetainedSequence: 1,
       latestCheckpointHash: null,
       retentionPolicyFence: 0,
     };
+    assertAuditChainState(state);
+    return state;
   }
 }
 
@@ -1538,24 +1540,29 @@ function assertRetentionPolicyFence(value: unknown): asserts value is RetentionP
 }
 
 /**
- * Validates caller-supplied expected chain state before comparing it with the
- * authoritative snapshot, rejecting malformed state rather than coercing it.
+ * Validates public expected-state and authoritative in-memory snapshots before
+ * they can steer append or crop. A zero tip is equivalent to a null tip hash;
+ * retained sequence one is equivalent to no latest checkpoint, while later
+ * retained minima require a valid checkpoint hash.
  */
-function assertAuditChainState(value: AuditChainState): void {
+export function assertAuditChainState(value: unknown): asserts value is AuditChainState {
+  const state = value as AuditChainState;
   if (
     typeof value !== "object" ||
     value === null ||
-    !Number.isSafeInteger(value.authoritativeTipSequence) ||
-    value.authoritativeTipSequence < 0 ||
-    !Number.isSafeInteger(value.minimumRetainedSequence) ||
-    value.minimumRetainedSequence < 1 ||
-    value.minimumRetainedSequence > value.authoritativeTipSequence + 1 ||
-    (value.authoritativeTipHash !== null && !/^[a-f0-9]{64}$/.test(value.authoritativeTipHash)) ||
-    (value.latestCheckpointHash !== null && !/^[a-f0-9]{64}$/.test(value.latestCheckpointHash))
+    !Number.isSafeInteger(state.authoritativeTipSequence) ||
+    state.authoritativeTipSequence < 0 ||
+    !Number.isSafeInteger(state.minimumRetainedSequence) ||
+    state.minimumRetainedSequence < 1 ||
+    state.minimumRetainedSequence > state.authoritativeTipSequence + 1 ||
+    (state.authoritativeTipHash !== null && !/^[a-f0-9]{64}$/.test(state.authoritativeTipHash)) ||
+    (state.latestCheckpointHash !== null && !/^[a-f0-9]{64}$/.test(state.latestCheckpointHash)) ||
+    (state.authoritativeTipSequence === 0) !== (state.authoritativeTipHash === null) ||
+    (state.minimumRetainedSequence === 1) !== (state.latestCheckpointHash === null)
   ) {
     throw new TypeError("invalid audit chain state");
   }
-  assertRetentionPolicyFence(value.retentionPolicyFence);
+  assertRetentionPolicyFence(state.retentionPolicyFence);
 }
 
 /**

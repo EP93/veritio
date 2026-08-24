@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  type AuditChainState,
   type AuditRecord,
   canonicalJson,
   createAuditEvent,
@@ -158,6 +159,26 @@ describe("SQL AuditStore adapters", () => {
     expect(await store.listCheckpoints({ tenantId: "org_123" })).toEqual([]);
   });
 
+  test("SQL append and crop reject relationally corrupt persisted chain state before mutation", async () => {
+    for (const operation of ["append", "crop"] as const) {
+      for (const invalid of relationallyInvalidChainStates) {
+        const client = createSqlClient();
+        const store = createPostgresAuditStore({ client });
+        const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+        const state = invalid(record.hash);
+        overwriteSqlChainState(client, state);
+        const before = sqlMutationSnapshot(client);
+
+        const attempted = operation === "append"
+          ? store.append(makeEvent("evt_02", "org_123", { role: "admin" }))
+          : store.compactRange({ tenantId: "org_123" }, checkpointForRecord(record), state, 0);
+        await expect(attempted).rejects.toThrow("invalid audit chain state");
+
+        expect(sqlMutationSnapshot(client)).toBe(before);
+      }
+    }
+  });
+
   test("SQL checkpoint reads reject redundant epoch and hash column corruption", async () => {
     const client = createSqlClient();
     const store = createPostgresAuditStore({ client });
@@ -260,6 +281,31 @@ describe("Mongo AuditStore adapter", () => {
 
     expect(await store.list({ tenantId: "org_123" })).toEqual([record]);
     expect(await store.listCheckpoints({ tenantId: "org_123" })).toEqual([]);
+  });
+
+  test("Mongo append and crop reject relationally corrupt persisted chain state before mutation", async () => {
+    for (const operation of ["append", "crop"] as const) {
+      for (const invalid of relationallyInvalidChainStates) {
+        const collection = createMongoCollection();
+        const retention = createMongoRetentionCollections();
+        const store = createMongoAuditStore({
+          collection,
+          retention,
+          transaction: async (run) => run({ collection }),
+        });
+        const record = await store.append(makeEvent("evt_01", "org_123", { role: "viewer" }));
+        const state = invalid(record.hash);
+        Object.assign(retentionDocuments(retention.chainStates)[0]!, state);
+        const before = mongoMutationSnapshot(collection, retention);
+
+        const attempted = operation === "append"
+          ? store.append(makeEvent("evt_02", "org_123", { role: "admin" }))
+          : store.compactRange({ tenantId: "org_123" }, checkpointForRecord(record), state, 0);
+        await expect(attempted).rejects.toThrow("invalid audit chain state");
+
+        expect(mongoMutationSnapshot(collection, retention)).toBe(before);
+      }
+    }
   });
 
   test("Mongo checkpoint reads reject redundant epoch and hash field corruption", async () => {
@@ -417,6 +463,82 @@ function makeEvent(id: string, tenantId: string, metadata: Record<string, unknow
     target: { type: "organization", id: tenantId },
     scope: { tenantId, environment: "test" },
     metadata,
+  });
+}
+
+/** Covers both sequence/hash null equivalence and retained-minimum/checkpoint equivalence. */
+const relationallyInvalidChainStates = [
+  (hash: string): AuditChainState => ({
+    authoritativeTipSequence: 0,
+    authoritativeTipHash: hash,
+    minimumRetainedSequence: 1,
+    latestCheckpointHash: null,
+    retentionPolicyFence: 0,
+  }),
+  (_hash: string): AuditChainState => ({
+    authoritativeTipSequence: 1,
+    authoritativeTipHash: null,
+    minimumRetainedSequence: 1,
+    latestCheckpointHash: null,
+    retentionPolicyFence: 0,
+  }),
+  (hash: string): AuditChainState => ({
+    authoritativeTipSequence: 1,
+    authoritativeTipHash: hash,
+    minimumRetainedSequence: 1,
+    latestCheckpointHash: hash,
+    retentionPolicyFence: 0,
+  }),
+  (hash: string): AuditChainState => ({
+    authoritativeTipSequence: 1,
+    authoritativeTipHash: hash,
+    minimumRetainedSequence: 2,
+    latestCheckpointHash: null,
+    retentionPolicyFence: 0,
+  }),
+] as const;
+
+/** Overwrites the SQL fake's persisted row without using adapter validation. */
+function overwriteSqlChainState(client: SqlAuditExecutor, state: AuditChainState): void {
+  const row = (
+    client as SqlAuditExecutor & { chainStates: SqlAuditChainStateRow[] }
+  ).chainStates[0];
+  if (!row) throw new TypeError("SQL chain state fixture is missing");
+  Object.assign(row, {
+    authoritative_tip_sequence: state.authoritativeTipSequence,
+    authoritative_tip_hash: state.authoritativeTipHash,
+    minimum_retained_sequence: state.minimumRetainedSequence,
+    latest_checkpoint_hash: state.latestCheckpointHash,
+    retention_policy_fence: state.retentionPolicyFence,
+  });
+}
+
+/** Captures all SQL authoritative mutation surfaces while excluding statement telemetry. */
+function sqlMutationSnapshot(client: SqlAuditExecutor): string {
+  const mutable = client as SqlAuditExecutor & {
+    rows: SqlAuditRow[];
+    chainStates: SqlAuditChainStateRow[];
+    ledger: unknown[];
+    checkpoints: unknown[];
+  };
+  return canonicalJson({
+    rows: mutable.rows,
+    chainStates: mutable.chainStates,
+    ledger: mutable.ledger,
+    checkpoints: mutable.checkpoints,
+  });
+}
+
+/** Captures Mongo rows plus every retention collection touched by append or crop. */
+function mongoMutationSnapshot(
+  collection: MongoAuditCollection & { documents: MongoAuditDocument[] },
+  retention: MongoRetentionCollections,
+): string {
+  return canonicalJson({
+    rows: collection.documents,
+    chainStates: retentionDocuments(retention.chainStates),
+    ledger: retentionDocuments(retention.idempotencyLedger),
+    checkpoints: retentionDocuments(retention.checkpoints),
   });
 }
 

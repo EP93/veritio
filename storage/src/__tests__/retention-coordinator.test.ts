@@ -174,6 +174,7 @@ describe("retention coordinator", () => {
     expect((await realStore.list({ tenantId: TENANT_ID }))).toEqual([]);
     expect(await realStore.listCheckpoints({ tenantId: TENANT_ID })).toEqual([result.checkpoint]);
     expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([result.disposition]);
+    if (!result.manifest) throw new Error("initial retention run must return its staged manifest");
     expect(result.checkpoint.archiveRootHash).toBe(result.manifest.archiveRootHash);
     expect(result.disposition.archiveRootHash).toBe(result.manifest.archiveRootHash);
     expect(await options.archive.confirmEpochAbsent(result.manifest)).toBe(true);
@@ -278,6 +279,32 @@ describe("retention coordinator", () => {
     expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([result.disposition]);
   });
 
+  test("a genuine cold invocation finishes disposal after crop with zero audit record bodies", async () => {
+    const log: string[] = [];
+    const store = await seedStore();
+    const client = createClient(log);
+    let fenceCalls = 0;
+    const first = await runOptions(store, client, {
+      withPolicyFence: (async (_version, operation) => {
+        fenceCalls += 1;
+        if (fenceCalls === 2) throw new Error("crash before cold disposal");
+        return operation();
+      }) as RetentionPolicyFenceRunner,
+    });
+    await expect(runRetentionEpoch(first)).rejects.toThrow("crash before cold disposal");
+    expect(await store.list({ tenantId: TENANT_ID })).toEqual([]);
+    expect(client.objects.size).toBeGreaterThan(0);
+    log.length = 0;
+
+    const cold = await runOptions(store, client, { records: [] });
+    const result = await runRetentionEpoch(cold);
+
+    expect(result.manifest).not.toBeNull();
+    expect(log).not.toContain("archive.put");
+    expect(client.objects.size).toBe(0);
+    expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([result.disposition]);
+  });
+
   test("a completed disposition rerun proves absence and returns the accepted receipt without provider writes", async () => {
     const log: string[] = [];
     const store = await seedStore();
@@ -289,7 +316,9 @@ describe("retention coordinator", () => {
 
     const replayed = await runRetentionEpoch(options);
 
-    expect(replayed).toEqual(first);
+    expect(replayed.manifest).toBeNull();
+    expect(replayed.checkpoint).toEqual(first.checkpoint);
+    expect(replayed.disposition).toEqual(first.disposition);
     expect(log).not.toContain("archive.put");
     expect(client.objects.size).toBe(0);
     expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([first.disposition]);
@@ -328,6 +357,53 @@ describe("retention coordinator", () => {
     expect(log).not.toContain("archive.put");
     expect(client.objects.size).toBe(0);
     expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([replayed.disposition]);
+  });
+
+  test("a genuine cold invocation confirms delete-before-confirm from checkpoint prefix state", async () => {
+    const log: string[] = [];
+    const realStore = await seedStore();
+    const client = createClient(log);
+    const crashingStore: CheckpointingAuditStore = {
+      append: realStore.append.bind(realStore),
+      list: realStore.list.bind(realStore),
+      getChainState: realStore.getChainState.bind(realStore),
+      advanceRetentionPolicyFence: realStore.advanceRetentionPolicyFence.bind(realStore),
+      compactRange: realStore.compactRange.bind(realStore),
+      listCheckpoints: realStore.listCheckpoints.bind(realStore),
+      prepareDisposition: realStore.prepareDisposition.bind(realStore),
+      listDispositions: realStore.listDispositions.bind(realStore),
+      async confirmDisposition() {
+        throw new Error("crash after cold delete before confirm");
+      },
+    };
+    const first = await runOptions(crashingStore, client);
+    await expect(runRetentionEpoch(first)).rejects.toThrow("crash after cold delete before confirm");
+    expect(client.objects.size).toBe(0);
+    expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([]);
+    log.length = 0;
+
+    const cold = await runOptions(realStore, client, { records: [] });
+    const result = await runRetentionEpoch(cold);
+
+    expect(result.manifest).toBeNull();
+    expect(log).not.toContain("archive.put");
+    expect(log).not.toContain("archive.delete");
+    expect(log).toContain("archive.get");
+    expect(log).toContain("archive.list");
+    expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([result.disposition]);
+  });
+
+  test("fails closed before provider I/O when neither a checkpoint nor record bodies exist", async () => {
+    const log: string[] = [];
+    const store = await seedStore();
+    const client = createClient(log);
+    const options = await runOptions(store, client, { records: [] });
+
+    await expect(runRetentionEpoch(options)).rejects.toThrow("retention epoch requires at least one record");
+
+    expect(log).toEqual([]);
+    expect(await store.list({ tenantId: TENANT_ID })).toHaveLength(3);
+    expect(await store.listCheckpoints({ tenantId: TENANT_ID })).toEqual([]);
   });
 
   test("serializes concurrent epochs so no stale run can PUT after the winner disposes", async () => {
@@ -535,6 +611,7 @@ describe("retention coordinator", () => {
     const result = await runRetentionEpoch(valid);
     const checkpointSnapshot = canonicalJson(result.checkpoint);
     const dispositionSnapshot = canonicalJson(result.disposition);
+    if (!result.manifest) throw new Error("initial retention run must return its staged manifest");
     result.manifest.segments[0]!.objectKey = "mutated";
     result.checkpoint.checkpointId = "mutated";
     result.disposition.dispositionId = "mutated";

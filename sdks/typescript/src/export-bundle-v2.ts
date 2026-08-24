@@ -75,6 +75,10 @@ export interface ExportBundleV2VerificationReport {
     commits: boolean;
     signature: "valid" | "invalid" | "absent" | "skipped";
   };
+  retentionSignatures: {
+    checkpoints: RetentionSignatureStatus;
+    dispositions: RetentionSignatureStatus;
+  };
   issues: string[];
 }
 
@@ -405,12 +409,15 @@ export async function verifyExportBundleV2(
   const edges = parsed.get("records/evidence-edges.jsonl") ?? [];
   const commits = parsed.get("records/commits.jsonl") ?? [];
   const origin = manifest.chainClaims.audit.origin;
+  const baselineCheckpointVerdict = verifyCheckpointClaim(origin, checkpoints, manifest.scope.tenantId);
   const checkpointVerdict = verifyCheckpointClaim(origin, checkpoints, manifest.scope.tenantId, options.retention);
   if (origin.kind === "checkpoint" && checkpoints.at(-1)?.hash !== origin.checkpointHash) {
     structure = false;
     issues.push("audit checkpoint origin does not select the latest included checkpoint");
   }
+  const baselineDispositionVerdict = verifyDispositionSet(dispositions, checkpoints);
   const dispositionVerdict = verifyDispositionSet(dispositions, checkpoints, options.retention);
+  const baselineAudit = verifyAuditClaim(origin, checkpoints, events, manifest.scope.tenantId);
   let checkpointOk = checkpointVerdict.valid;
   let dispositionOk = dispositionVerdict.valid;
   let audit = verifyAuditClaim(origin, checkpoints, events, manifest.scope.tenantId, options.retention);
@@ -427,9 +434,9 @@ export async function verifyExportBundleV2(
     checkpointOk = dispositionOk = audit = edge = commit = false;
     issues.push("embedded verification report unreadable");
   } else {
-    if (canonicalJson(embedded.checkpoints) !== canonicalJson(checkpointVerdict)) checkpointOk = false;
-    if (canonicalJson(embedded.dispositions) !== canonicalJson(dispositionVerdict)) dispositionOk = false;
-    if (embedded.audit.valid !== audit) audit = false;
+    if (canonicalJson(embedded.checkpoints) !== canonicalJson(baselineCheckpointVerdict)) checkpointOk = false;
+    if (canonicalJson(embedded.dispositions) !== canonicalJson(baselineDispositionVerdict)) dispositionOk = false;
+    if (embedded.audit.valid !== baselineAudit) audit = false;
     if (embedded.edges.valid !== edge) edge = false;
     if (embedded.commits.valid !== commit) commit = false;
   }
@@ -451,6 +458,10 @@ export async function verifyExportBundleV2(
       edges: edge,
       commits: commit,
       signature: signatureVerdict.signature,
+    },
+    retentionSignatures: {
+      checkpoints: checkpointVerdict.signature,
+      dispositions: dispositionVerdict.signature,
     },
     issues,
   };
@@ -943,6 +954,7 @@ function failedV2Report(
       commits: false,
       signature,
     },
+    retentionSignatures: { checkpoints: "absent", dispositions: "absent" },
     issues,
   };
 }

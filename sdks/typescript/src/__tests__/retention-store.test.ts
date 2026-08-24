@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  assertAuditChainState,
   createAuditEvent,
   createRetentionCheckpoint,
   createRetentionDisposition,
   MemoryAuditStore,
+  type AuditChainState,
   type AuditEvent,
   type AuditRecord,
   type DispositionAttempt,
@@ -13,6 +15,41 @@ import {
 const TENANT_ID = "org_retention";
 const SCOPE = { tenantId: TENANT_ID };
 const ARCHIVE_ROOT_HASH = "a".repeat(64);
+const VALID_STATE_HASH = "b".repeat(64);
+
+/** Enumerates relationally impossible states that remain individually well-typed. */
+function invalidChainStates(): AuditChainState[] {
+  return [
+    {
+      authoritativeTipSequence: 0,
+      authoritativeTipHash: VALID_STATE_HASH,
+      minimumRetainedSequence: 1,
+      latestCheckpointHash: null,
+      retentionPolicyFence: 0,
+    },
+    {
+      authoritativeTipSequence: 1,
+      authoritativeTipHash: null,
+      minimumRetainedSequence: 1,
+      latestCheckpointHash: null,
+      retentionPolicyFence: 0,
+    },
+    {
+      authoritativeTipSequence: 1,
+      authoritativeTipHash: VALID_STATE_HASH,
+      minimumRetainedSequence: 1,
+      latestCheckpointHash: VALID_STATE_HASH,
+      retentionPolicyFence: 0,
+    },
+    {
+      authoritativeTipSequence: 1,
+      authoritativeTipHash: VALID_STATE_HASH,
+      minimumRetainedSequence: 2,
+      latestCheckpointHash: null,
+      retentionPolicyFence: 0,
+    },
+  ];
+}
 
 /**
  * Builds deterministic tenant audit input so retention assertions depend only
@@ -71,6 +108,48 @@ async function compactFixture(store: MemoryAuditStore): Promise<RetentionCheckpo
 }
 
 describe("MemoryAuditStore retention checkpoints", () => {
+  test("validates exact chain-state sequence/hash and retained-minimum/checkpoint relations before crop", async () => {
+    for (const valid of [
+      {
+        authoritativeTipSequence: 0,
+        authoritativeTipHash: null,
+        minimumRetainedSequence: 1,
+        latestCheckpointHash: null,
+        retentionPolicyFence: 0,
+      },
+      {
+        authoritativeTipSequence: 1,
+        authoritativeTipHash: VALID_STATE_HASH,
+        minimumRetainedSequence: 1,
+        latestCheckpointHash: null,
+        retentionPolicyFence: 0,
+      },
+      {
+        authoritativeTipSequence: 1,
+        authoritativeTipHash: VALID_STATE_HASH,
+        minimumRetainedSequence: 2,
+        latestCheckpointHash: VALID_STATE_HASH,
+        retentionPolicyFence: 0,
+      },
+    ] satisfies AuditChainState[]) {
+      expect(() => assertAuditChainState(valid)).not.toThrow();
+    }
+    for (const invalid of invalidChainStates()) {
+      expect(() => assertAuditChainState(invalid)).toThrow("invalid audit chain state");
+    }
+
+    const store = new MemoryAuditStore();
+    const record = await store.append(auditEvent("evt_relational", 1));
+    const checkpoint = checkpointFor([record]);
+    for (const invalid of invalidChainStates()) {
+      await expect(store.compactRange(SCOPE, checkpoint, invalid, invalid.retentionPolicyFence)).rejects.toThrow(
+        "invalid audit chain state",
+      );
+      expect(await store.list(SCOPE)).toEqual([record]);
+      expect(await store.listCheckpoints(SCOPE)).toEqual([]);
+    }
+  });
+
   test("continues the authoritative sequence and original hash link after a full-prefix crop", async () => {
     const store = new MemoryAuditStore();
     const first = await store.append(auditEvent("evt_1", 1));

@@ -103,9 +103,11 @@ export type RetentionStagingVerification =
 export interface RetentionStagingArchive {
   deriveEpoch(input: SealRetentionEpochInput): RetentionStagingManifest;
   sealEpoch(input: SealRetentionEpochInput): Promise<RetentionStagingManifest>;
+  recoverEpoch(checkpoint: RetentionCheckpoint): Promise<RetentionStagingManifest | null>;
   verifyEpoch(manifest: RetentionStagingManifest): Promise<RetentionStagingVerification>;
   deleteEpoch(manifest: RetentionStagingManifest): Promise<void>;
   confirmEpochAbsent(manifest: RetentionStagingManifest): Promise<boolean>;
+  confirmCheckpointEpochAbsent(checkpoint: RetentionCheckpoint): Promise<boolean>;
 }
 
 /** Injected object client and isolated key namespace for derived staging. */
@@ -183,6 +185,22 @@ export function createRetentionStagingArchive(options: RetentionStagingArchiveOp
       offset += segment.recordCount;
     }
     await putExact(client, manifest.manifestKey, new TextEncoder().encode(canonicalJson(manifest)));
+    return cloneManifest(manifest);
+  }
+
+  /**
+   * Loads the deterministic manifest key for a durably stored checkpoint and
+   * accepts its provider lookups only after the canonical manifest binds every
+   * checkpoint field. A missing manifest is returned explicitly because it can
+   * mean deletion completed before authoritative receipt confirmation.
+   */
+  async function recoverEpoch(checkpoint: RetentionCheckpoint): Promise<RetentionStagingManifest | null> {
+    assertRecoverableCheckpoint(checkpoint);
+    const manifestKey = `${epochKeyPrefix(prefix, checkpoint.tenantId, checkpoint.epoch)}/manifest.json`;
+    const manifestBytes = await client.get(manifestKey);
+    if (manifestBytes === null) return null;
+    const manifest = parseManifest(new TextDecoder().decode(manifestBytes), prefix);
+    assertManifestCheckpointBinding(manifest, checkpoint);
     return cloneManifest(manifest);
   }
 
@@ -283,7 +301,29 @@ export function createRetentionStagingArchive(options: RetentionStagingArchiveOp
     return directReadsAbsent && listedKeys.length === 0;
   }
 
-  return { deriveEpoch, sealEpoch, verifyEpoch, deleteEpoch, confirmEpochAbsent };
+  /**
+   * Confirms a post-delete checkpoint epoch without reconstructing segment keys
+   * from disposed event bodies. The deterministic manifest key must be absent
+   * by direct GET and the complete tenant/epoch prefix must be empty by LIST;
+   * a missing manifest alone never establishes provider absence.
+   */
+  async function confirmCheckpointEpochAbsent(checkpoint: RetentionCheckpoint): Promise<boolean> {
+    assertRecoverableCheckpoint(checkpoint);
+    const epochPrefix = epochKeyPrefix(prefix, checkpoint.tenantId, checkpoint.epoch);
+    const manifestBytes = await client.get(`${epochPrefix}/manifest.json`);
+    const listedKeys = await client.list(`${epochPrefix}/`);
+    return manifestBytes === null && listedKeys.length === 0;
+  }
+
+  return {
+    deriveEpoch,
+    sealEpoch,
+    recoverEpoch,
+    verifyEpoch,
+    deleteEpoch,
+    confirmEpochAbsent,
+    confirmCheckpointEpochAbsent,
+  };
 }
 
 /** Validates the caller's tenant, prior anchor, exact range, and record hashes before any write. */
@@ -327,6 +367,32 @@ function validateSealInput(input: SealRetentionEpochInput): {
     previousHash = record.hash;
   }
   return { previousHash: input.records[0]!.previousHash, checkpointHash };
+}
+
+/** Rejects malformed checkpoint identities before they can steer a provider key lookup. */
+function assertRecoverableCheckpoint(checkpoint: RetentionCheckpoint): void {
+  const verification = verifyRetentionCheckpoint(checkpoint);
+  if (!verification.ok) throw new TypeError(`invalid retention checkpoint: ${verification.reason}`);
+}
+
+/** Requires recovered derived metadata to bind the complete authoritative checkpoint anchor. */
+function assertManifestCheckpointBinding(
+  manifest: RetentionStagingManifest,
+  checkpoint: RetentionCheckpoint,
+): void {
+  if (
+    manifest.tenantId !== checkpoint.tenantId ||
+    manifest.epoch !== checkpoint.epoch ||
+    manifest.fromSequence !== checkpoint.fromSequence ||
+    manifest.fromPreviousHash !== checkpoint.fromPreviousHash ||
+    manifest.throughSequence !== checkpoint.throughSequence ||
+    manifest.throughHash !== checkpoint.throughHash ||
+    manifest.recordCount !== checkpoint.recordCount ||
+    manifest.previousCheckpointHash !== checkpoint.previousCheckpointHash ||
+    manifest.archiveRootHash !== checkpoint.archiveRootHash
+  ) {
+    throw new TypeError("staged epoch manifest checkpoint mismatch");
+  }
 }
 
 /** Writes bytes only when the deterministic key is absent or already byte-identical. */
