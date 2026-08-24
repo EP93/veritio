@@ -1629,12 +1629,24 @@ export {
 } from "./export-bundle.js";
 export type {
   ExportBundle,
+  ExportBundleV1,
   ExportBundleFileEntry,
   ExportBundleInput,
   ExportBundleManifest,
   ExportBundleSignature,
+  ExportBundleVerificationOptions,
   ExportBundleVerificationReport,
 } from "./export-bundle.js";
+export { buildExportBundleV2, verifyExportBundleV2 } from "./export-bundle-v2.js";
+export type {
+  AuditOriginClaim,
+  ExportBundleV2,
+  ExportBundleV2ChainClaims,
+  ExportBundleV2Input,
+  ExportBundleV2Manifest,
+  ExportBundleV2VerificationReport,
+  GenesisOriginClaim,
+} from "./export-bundle-v2.js";
 export { verifyAuditChainScoped, verifyEdgeChainScoped } from "./export-bundle-chain-modes.js";
 export type { ExportBundleChainScope } from "./export-bundle-chain-modes.js";
 export * from "./retention.js";
