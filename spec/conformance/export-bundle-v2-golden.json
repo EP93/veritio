@@ -43,35 +43,41 @@
         {
           "path": "records/audit-events.jsonl",
           "sha256": "f057bf4869dbbca5a218e69f99f601d49644e264686b60c5b60675d19961ccbf",
-          "records": 1
+          "records": 1,
+          "bytes": 641
         },
         {
           "path": "records/evidence-edges.jsonl",
           "sha256": "0255266cd0f451f8782050f43a753aad20be3b195059560706bc6e0a47b49ba3",
-          "records": 1
+          "records": 1,
+          "bytes": 676
         },
         {
           "path": "records/commits.jsonl",
           "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-          "records": 0
+          "records": 0,
+          "bytes": 0
         },
         {
           "path": "records/retention-checkpoints.jsonl",
           "sha256": "71a4581c63cd1ccae2ad645aeeb98a2015339a0d6fe95ac0cdb38cbaa7ab01f9",
-          "records": 2
+          "records": 2,
+          "bytes": 1307
         },
         {
           "path": "records/retention-dispositions.jsonl",
           "sha256": "421eeb7453f30007ee74c328d62074b5adfe5f2b2a4f5e9334c87ea6b8460eb9",
-          "records": 2
+          "records": 2,
+          "bytes": 1176
         },
         {
           "path": "verification.json",
           "sha256": "8ea1330aa9b90b1d601cc953f86e2612844dba043f5da3f8af83b218bc470654",
-          "records": 0
+          "records": 0,
+          "bytes": 173
         }
       ],
-      "rootHash": "62beb42f0dcd6761970d62d0fdd07f2b6e4128628708f7088b703afc03fa4810"
+      "rootHash": "186b5dd96e28e49bd8442861f1220d5aa3d601091590db76e0f829a6b67d48a2"
     },
     "files": {
       "records/audit-events.jsonl": "{\"appendedAt\":\"2026-08-24T00:12:01.000Z\",\"canonicalization\":\"veritio-json-v1\",\"event\":{\"action\":\"retention.tail.retained\",\"actor\":{\"id\":\"retention_fixture\",\"type\":\"system\"},\"id\":\"evt_retained_004\",\"metadata\":{},\"occurredAt\":\"2026-08-24T00:12:00.000Z\",\"schemaVersion\":\"2026-06-10\",\"scope\":{\"tenantId\":\"org_fixture\"},\"target\":{\"id\":\"rec_004\",\"type\":\"record\"}},\"hash\":\"3520aacc1d5fd10c1837e72a6f811015044a1c61ea20b8f19de32c6e729e858d\",\"hashAlgorithm\":\"sha256\",\"idempotencyKeyHash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"previousHash\":\"6417b8916ca4224a860e9b7ba9870e6ab34c30772f029775ff1fb9af88b11f3a\",\"sequence\":4}\n",

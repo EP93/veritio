@@ -6,12 +6,22 @@ import {
   canonicalJson,
   computeRootHash,
   type ExportBundleV2,
+  hashAuditRecord,
+  hashEvidenceEdgeRecord,
   parseExportBundle,
   serializeExportBundle,
   verifyExportBundle,
 } from "../index";
 
 const CONFORMANCE_DIR = join(import.meta.dir, "../../../../spec/conformance");
+const V2_PATHS = [
+  "records/audit-events.jsonl",
+  "records/evidence-edges.jsonl",
+  "records/commits.jsonl",
+  "records/retention-checkpoints.jsonl",
+  "records/retention-dispositions.jsonl",
+  "verification.json",
+] as const;
 
 /** Loads a committed conformance artifact without regenerating its expectations. */
 async function fixture(name: string): Promise<any> {
@@ -41,10 +51,133 @@ async function rebindFile(bundle: ExportBundleV2, path: string): Promise<void> {
     .update(bundle.files[path] ?? "")
     .digest("hex");
   entry.records = bundle.files[path] ? bundle.files[path]!.trimEnd().split("\n").length : 0;
+  (entry as any).bytes = new TextEncoder().encode(bundle.files[path] ?? "").byteLength;
   bundle.manifest.rootHash = await computeRootHash(bundle.manifest.files);
 }
 
+/** Rebinds a semantically mutated record and all outer file/manifest hashes. */
+async function rebindRecord(
+  bundle: ExportBundleV2,
+  path: "records/audit-events.jsonl" | "records/evidence-edges.jsonl",
+  mutate: (record: any) => void,
+): Promise<void> {
+  const record = JSON.parse(bundle.files[path]!.trim());
+  mutate(record);
+  delete record.hash;
+  record.hash = path === "records/audit-events.jsonl" ? hashAuditRecord(record) : hashEvidenceEdgeRecord(record);
+  bundle.files[path] = `${canonicalJson(record)}\n`;
+  await rebindFile(bundle, path);
+}
+
 describe("vevb-2 checkpoint-aware export", () => {
+  test("direct verification rejects an unknown bundle discriminator instead of treating it as vevb-1", async () => {
+    const data = await fixture("export-bundle-golden.json");
+    const unknown = { ...clone(data.bundle), bundleVersion: "vevb-3" };
+    await expect(verifyExportBundle(unknown as never)).rejects.toThrow(
+      'verifyExportBundle: unsupported bundleVersion "vevb-3"',
+    );
+  });
+
+  test("v2 parsing rejects open or malformed container and manifest shapes", async () => {
+    const data = await fixture("export-bundle-v2-golden.json");
+    const base = data.bundle as ExportBundleV2;
+    for (const invalid of [
+      { ...clone(base), hostedProjectId: "hosted_only" },
+      { ...clone(base), files: [] },
+      { ...clone(base), manifest: { ...clone(base.manifest), hostedRegion: "private" } },
+      { ...clone(base), manifest: { ...clone(base.manifest), chainClaims: [] } },
+    ]) {
+      expect(() => parseExportBundle(JSON.stringify(invalid))).toThrow("export bundle: invalid vevb-2 container");
+    }
+  });
+
+  test("rejects open or incomplete audit and edge envelopes and nested protocol records after hashes are rebound", async () => {
+    const data = await fixture("export-bundle-v2-golden.json");
+    const base = data.bundle as ExportBundleV2;
+    const auditMutations: Array<(record: any) => void> = [
+      (record) => delete record.appendedAt,
+      (record) => {
+        record.event.hostedProjectId = "hosted_only";
+      },
+      (record) => delete record.event.metadata,
+      (record) => {
+        record.event.actor.hostedUserId = "hosted_only";
+      },
+      (record) => delete record.event.actor.id,
+    ];
+    for (const mutate of auditMutations) {
+      const bundle = clone(base);
+      await rebindRecord(bundle, "records/audit-events.jsonl", mutate);
+      expect((await verifyExportBundle(bundle)).checks.audit).toBe(false);
+    }
+
+    const edgeMutations: Array<(record: any) => void> = [
+      (record) => delete record.appendedAt,
+      (record) => {
+        record.edge.hostedRegion = "private";
+      },
+      (record) => delete record.edge.metadata,
+      (record) => {
+        record.edge.from.hostedEntityId = "hosted_only";
+      },
+      (record) => delete record.edge.to.id,
+    ];
+    for (const mutate of edgeMutations) {
+      const bundle = clone(base);
+      await rebindRecord(bundle, "records/evidence-edges.jsonl", mutate);
+      expect((await verifyExportBundle(bundle)).checks.edges).toBe(false);
+    }
+  });
+
+  test("schema and runtime require exactly one descriptor for each mandatory v2 path", async () => {
+    const schema = await Bun.file(join(import.meta.dir, "../../../../spec/export-bundle-v2.schema.json")).json();
+    const descriptorSchema = schema.$defs.manifest.properties.files;
+    expect(descriptorSchema.items.properties.path.enum).toEqual(V2_PATHS);
+    expect(descriptorSchema.allOf.map((rule: any) => rule.contains.properties.path.const)).toEqual(V2_PATHS);
+    expect(descriptorSchema.allOf.every((rule: any) => rule.minContains === 1 && rule.maxContains === 1)).toBe(true);
+
+    const data = await fixture("export-bundle-v2-golden.json");
+    const duplicate = clone(data.bundle as ExportBundleV2);
+    duplicate.manifest.files[5]!.path = V2_PATHS[0];
+    delete duplicate.files[V2_PATHS[5]];
+    duplicate.files["records/hosted-only.jsonl"] = "";
+    expect(() => parseExportBundle(JSON.stringify(duplicate))).toThrow("export bundle: invalid vevb-2 container");
+  });
+
+  test("binds exact UTF-8 byte sizes for all six files and reserves zero records for verification.json", async () => {
+    const data = await fixture("export-bundle-v2-golden.json");
+    const base = data.bundle as ExportBundleV2;
+    expect(base.manifest.files.map((entry: any) => entry.bytes)).toEqual(
+      base.manifest.files.map((entry) => new TextEncoder().encode(base.files[entry.path]!).byteLength),
+    );
+
+    const wrongBytes = clone(base) as any;
+    wrongBytes.manifest.files[0].bytes += 1;
+    wrongBytes.manifest.rootHash = await computeRootHash(wrongBytes.manifest.files);
+    expect((await verifyExportBundle(wrongBytes)).checks.integrity).toBe(false);
+
+    const verificationRecords = clone(base);
+    verificationRecords.manifest.files.find((entry) => entry.path === "verification.json")!.records = 1;
+    verificationRecords.manifest.rootHash = await computeRootHash(verificationRecords.manifest.files);
+    expect((await verifyExportBundle(verificationRecords)).checks.structure).toBe(false);
+  });
+
+  test("uses one exact UTC-millisecond calendar timestamp contract in schema and runtime", async () => {
+    const data = await fixture("export-bundle-v2-golden.json");
+    const base = data.bundle as ExportBundleV2;
+    const invalid = ["2026-08-24", "2026-02-30T00:00:00.000Z", "2026-08-24T00:00:00Z", "2026-08-24T07:00:00.000+07:00"];
+    for (const createdAt of invalid) {
+      const bundle = clone(base);
+      bundle.manifest.createdAt = createdAt;
+      expect(() => parseExportBundle(JSON.stringify(bundle))).toThrow("export bundle: invalid vevb-2 container");
+    }
+
+    const schema = await Bun.file(join(import.meta.dir, "../../../../spec/export-bundle-v2.schema.json")).json();
+    const timestampPattern = new RegExp(schema.$defs.timestamp.pattern);
+    expect(invalid.every((value) => !timestampPattern.test(value))).toBe(true);
+    expect(timestampPattern.test("2024-02-29T23:59:59.999Z")).toBe(true);
+  });
+
   test("parses and verifies the pinned checkpoint-aware fixture", async () => {
     const data = await fixture("export-bundle-v2-golden.json");
     const bundle = parseExportBundle(JSON.stringify(data.bundle));

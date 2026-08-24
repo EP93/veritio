@@ -12,6 +12,11 @@ manifest. Unknown versions, keys, algorithms, or shapes fail closed. Record
 files use the v1 canonical JSONL rule: one `veritio-json-v1` record per line, a
 single trailing newline, and the empty string for zero records.
 
+All v2 manifest, audit-envelope, event, edge-envelope, and edge timestamps are
+real RFC 3339 UTC instants with exactly three fractional digits and a `Z`
+designator (`YYYY-MM-DDTHH:mm:ss.sssZ`). Date-only, offset, impossible calendar,
+and normalized rollover values fail closed.
+
 The mandatory file map contains exactly:
 
 - `records/audit-events.jsonl`
@@ -21,10 +26,12 @@ The mandatory file map contains exactly:
 - `records/retention-dispositions.jsonl`
 - `verification.json`
 
-Every manifest entry is `{ path, sha256, records }`. `sha256` covers the exact
-UTF-8 file bytes. `records` is the JSONL line count (`verification.json` uses
-zero). `rootHash` is SHA-256 of canonical JSON for a copy of the six entries
-sorted by path with raw UTF-16 code-unit ordering, identical to v1.
+Every manifest entry is `{ path, sha256, records, bytes }`. `sha256` covers the
+exact UTF-8 file bytes, and the v2-only `bytes` field is their exact UTF-8 byte
+length. `records` is the JSONL line count; `verification.json` must use zero.
+`rootHash` is SHA-256 of canonical JSON for a copy of the six entries sorted by
+path with raw UTF-16 code-unit ordering. The added v2 field does not change v1
+descriptors or hashes.
 
 The optional Ed25519 bundle signature uses the v1 contract: its public-key
 fingerprint is bound into the manifest, and the signature covers the UTF-8 bytes
@@ -61,6 +68,13 @@ combined with a window, filter, or caller-defined completeness string.
 Evidence edges are always a full chain from genesis and use the existing strict
 edge verifier. Evidence commits are always genesis/empty and their file must be
 the empty string. Retention v1 does not compact either record family.
+
+Every audit JSONL member must match the closed `audit-record.schema.json`
+envelope and closed nested `event.schema.json` event, including every required
+field. Every edge member must likewise match `edge-record.schema.json` and its
+nested `edge.schema.json` edge. Missing or unknown envelope/nested fields,
+including hosted-only fields, fail even when all record, file, and manifest
+hashes are rebound.
 
 ## Checkpoint and disposition verification
 

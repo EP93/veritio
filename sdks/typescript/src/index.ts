@@ -1642,6 +1642,7 @@ export type {
   AuditOriginClaim,
   ExportBundleV2,
   ExportBundleV2ChainClaims,
+  ExportBundleV2FileEntry,
   ExportBundleV2Input,
   ExportBundleV2Manifest,
   ExportBundleV2VerificationReport,

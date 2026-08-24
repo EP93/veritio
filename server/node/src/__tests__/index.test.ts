@@ -572,6 +572,20 @@ describe("MCP JSON-RPC handler", () => {
     expect(toolNames).not.toContain("veritio.record_event");
   });
 
+  test("describes the v1 default and explicit host-injected v2 export boundary", async () => {
+    const response = await handleMcpRequest(
+      new LocalEvidenceStore(),
+      { jsonrpc: "2.0", id: 10, method: "tools/list", params: {} },
+      { allowWriteTools: true },
+    );
+    const tool = response.result.tools.find(
+      (candidate: { name: string }) => candidate.name === "veritio.create_export_bundle",
+    );
+    expect(tool.description).toBe(
+      "Emit a portable, verifiable evidence export bundle: vevb-1 by default, or vevb-2 only with explicit host-injected checkpoint inputs, when write tools are enabled.",
+    );
+  });
+
   test("allows write tools only when explicitly enabled", async () => {
     const store = new LocalEvidenceStore();
     const blocked = await handleMcpRequest(store, {

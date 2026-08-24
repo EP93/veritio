@@ -12,7 +12,13 @@
 
 import { canonicalJson, sha256Hex, verifyCommitChain } from "./export-bundle-deps.js";
 import { verifyAuditChainScoped, verifyEdgeChainScoped } from "./export-bundle-chain-modes.js";
-import { verifyExportBundleV2, type ExportBundleV2, type ExportBundleV2Manifest, type ExportBundleV2VerificationReport } from "./export-bundle-v2.js";
+import {
+  isExportBundleV2Container,
+  verifyExportBundleV2,
+  type ExportBundleV2,
+  type ExportBundleV2Manifest,
+  type ExportBundleV2VerificationReport,
+} from "./export-bundle-v2.js";
 import type { RetentionVerificationOptions } from "./retention.js";
 
 /**
@@ -409,6 +415,10 @@ export function parseExportBundle(text: string): ExportBundle {
     throw new Error(`export bundle: unsupported bundleVersion ${JSON.stringify(container.bundleVersion)}`);
   }
 
+  if (container.bundleVersion === "vevb-2" && !isExportBundleV2Container(container)) {
+    throw new Error("export bundle: invalid vevb-2 container");
+  }
+
   if (
     typeof container.manifest !== "object" ||
     container.manifest === null ||
@@ -565,7 +575,10 @@ export async function verifyExportBundle(
     throw new TypeError("verifyExportBundle: expected an ExportBundle object");
   }
   if (bundle.bundleVersion === "vevb-2") return verifyExportBundleV2(bundle, opts);
-  return verifyExportBundleV1(bundle, opts);
+  if (bundle.bundleVersion === "vevb-1") return verifyExportBundleV1(bundle, opts);
+  throw new TypeError(
+    `verifyExportBundle: unsupported bundleVersion ${JSON.stringify((bundle as Record<string, unknown>).bundleVersion)}`,
+  );
 }
 
 /** Preserves the original vevb-1 verification path byte-for-byte. */

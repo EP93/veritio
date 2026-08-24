@@ -1,9 +1,4 @@
-import type {
-  ExportBundleFileEntry,
-  ExportBundleManifest,
-  ExportBundleSignature,
-  ExportBundleVerificationOptions,
-} from "./export-bundle.js";
+import type { ExportBundleManifest, ExportBundleSignature, ExportBundleVerificationOptions } from "./export-bundle.js";
 import { canonicalJson, sha256Hex, verifyCommitChain, verifyEdgeChain } from "./export-bundle-deps.js";
 import type { AuditRecord, EvidenceEdgeRecord } from "./index.js";
 import { verifyAuditRecords } from "./index.js";
@@ -35,9 +30,17 @@ export interface ExportBundleV2Manifest {
   range: ExportBundleManifest["range"];
   producer: ExportBundleManifest["producer"];
   chainClaims: ExportBundleV2ChainClaims;
-  files: ExportBundleFileEntry[];
+  files: ExportBundleV2FileEntry[];
   rootHash: string;
   signaturePublicKeyFingerprint?: string;
+}
+
+/** V2-only descriptor that binds both content hash and exact UTF-8 byte size. */
+export interface ExportBundleV2FileEntry {
+  path: string;
+  sha256: string;
+  records: number;
+  bytes: number;
 }
 
 export interface ExportBundleV2 {
@@ -84,6 +87,7 @@ interface EmbeddedV2Verification {
 }
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
+const TIMESTAMP_PATTERN = /^\d{4}-(0[1-9]|1[0-2])-([0-2]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$/;
 const CONTAINER_KEYS = new Set(["bundleVersion", "manifest", "files", "signature"]);
 const MANIFEST_KEYS = new Set([
   "bundleVersion",
@@ -103,7 +107,7 @@ const CLAIM_KEYS = new Set(["audit", "evidenceEdges", "evidenceCommits"]);
 const CHAIN_CLAIM_KEYS = new Set(["origin", "completeness"]);
 const GENESIS_ORIGIN_KEYS = new Set(["kind"]);
 const CHECKPOINT_ORIGIN_KEYS = new Set(["kind", "checkpointHash"]);
-const FILE_ENTRY_KEYS = new Set(["path", "sha256", "records"]);
+const FILE_ENTRY_KEYS = new Set(["path", "sha256", "records", "bytes"]);
 const SIGNATURE_KEYS = new Set(["algorithm", "publicKeyFingerprint", "signature"]);
 const AUDIT_RECORD_KEYS = new Set([
   "event",
@@ -125,6 +129,112 @@ const EDGE_RECORD_KEYS = new Set([
   "idempotencyKeyHash",
   "hash",
 ]);
+const EVENT_KEYS = new Set([
+  "id",
+  "schemaVersion",
+  "occurredAt",
+  "actor",
+  "action",
+  "target",
+  "scope",
+  "requestId",
+  "purpose",
+  "lawfulBasis",
+  "dataCategories",
+  "retention",
+  "metadata",
+]);
+const EVENT_REQUIRED_KEYS = ["id", "schemaVersion", "occurredAt", "actor", "action", "target", "metadata"] as const;
+const ACTOR_KEYS = new Set(["type", "id", "display"]);
+const TARGET_KEYS = new Set(["type", "id", "display"]);
+const EVENT_SCOPE_KEYS = new Set(["tenantId", "workspaceId", "environment"]);
+const EDGE_KEYS = new Set(["id", "schemaVersion", "occurredAt", "scope", "from", "relation", "to", "metadata"]);
+const EDGE_REQUIRED_KEYS = ["id", "schemaVersion", "occurredAt", "from", "relation", "to", "metadata"] as const;
+const ENTITY_KEYS = new Set(["type", "id", "actorType", "resourceType", "version", "pathHash"]);
+const ACTOR_TYPES = new Set(["user", "system", "service", "ai_agent", "anonymous"]);
+const LAWFUL_BASES = new Set([
+  "consent",
+  "contract",
+  "legal_obligation",
+  "vital_interests",
+  "public_task",
+  "legitimate_interests",
+  "not_applicable",
+]);
+const ENTITY_TYPES = new Set([
+  "tenant",
+  "principal",
+  "actor",
+  "activity",
+  "change",
+  "revision",
+  "assertion",
+  "record",
+  "evidence_commit",
+  "data_subject",
+  "resource",
+  "data_category",
+  "purpose",
+  "policy",
+  "consent",
+  "processor",
+  "system",
+  "repository",
+  "branch",
+  "commit",
+  "pull_request",
+  "file",
+  "diff_hunk",
+  "agent_session",
+  "tool_call",
+  "ci_run",
+  "artifact",
+  "deployment",
+  "runtime_event",
+  "subject_request",
+  "export_bundle",
+]);
+const ENTITY_ACTOR_TYPES = new Set(["user", "service", "system", "ai_agent"]);
+const EDGE_RELATIONS = new Set([
+  "caused_by",
+  "part_of",
+  "read",
+  "modified",
+  "created",
+  "deleted",
+  "derived_from",
+  "reviewed_by",
+  "approved_by",
+  "waived_by",
+  "built_by",
+  "deployed_as",
+  "observed_in",
+  "attests_to",
+  "exports",
+  "satisfies_policy",
+  "violates_policy",
+  "subject_of",
+  "processed_for",
+  "retained_under",
+  "sent_to",
+  "has_activity",
+  "has_input",
+  "has_output",
+  "has_assertion",
+  "resulted_in",
+  "performed_by",
+  "used",
+  "generated",
+  "based_on",
+  "asserts_about",
+  "retracts",
+  "corrects",
+  "supersedes",
+  "disputes",
+  "confirms",
+  "compensates",
+]);
+const ACTION_PATTERN = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 const BASE64_SIGNATURE_PATTERN = /^[A-Za-z0-9+/]{86}==$/;
 const RECORD_PATHS = [
   "records/audit-events.jsonl",
@@ -134,6 +244,14 @@ const RECORD_PATHS = [
   "records/retention-dispositions.jsonl",
 ] as const;
 const REQUIRED_PATHS = [...RECORD_PATHS, "verification.json"] as const;
+
+/**
+ * Narrows an untrusted value only when its v2 container, manifest, claims,
+ * descriptor list, file map, and optional signature have closed protocol shapes.
+ */
+export function isExportBundleV2Container(value: unknown): value is ExportBundleV2 {
+  return verifyV2Shape(value, []);
+}
 
 /**
  * Builds the closed vevb-2 container from host-injected records and an explicit
@@ -163,9 +281,7 @@ export async function buildExportBundleV2(input: ExportBundleV2Input): Promise<E
   const auditValid = verifyAuditClaim(input.auditOrigin, checkpoints, input.events, input.scope.tenantId);
   if (!auditValid) throw new TypeError("export bundle v2: invalid audit selection");
   const edgesValid =
-    verifyEdgeChain(input.edges).valid &&
-    recordsMatchTenant(input.edges, "edge", input.scope.tenantId) &&
-    recordsHaveOnlyEnvelopeKeys(input.edges, EDGE_RECORD_KEYS);
+    verifyEdgeChain(input.edges).valid && recordsAreValidEdgeRecords(input.edges, input.scope.tenantId);
   if (!edgesValid) throw new TypeError("export bundle v2: evidence edges must be a full genesis chain");
 
   const chainClaims: ExportBundleV2ChainClaims =
@@ -200,7 +316,12 @@ export async function buildExportBundleV2(input: ExportBundleV2Input): Promise<E
   ];
   const files = Object.fromEntries(tracked.map((file) => [file.path, file.content]));
   const manifestFiles = await Promise.all(
-    tracked.map(async (file) => ({ path: file.path, sha256: await sha256Hex(file.content), records: file.records })),
+    tracked.map(async (file) => ({
+      path: file.path,
+      sha256: await sha256Hex(file.content),
+      records: file.records,
+      bytes: utf8Size(file.content),
+    })),
   );
   const manifest: ExportBundleV2Manifest = {
     bundleVersion: "vevb-2",
@@ -239,10 +360,19 @@ export async function verifyExportBundleV2(
   }
   for (const entry of manifest.files) {
     const payload = files[entry.path];
-    if (typeof payload !== "string" || (await sha256Hex(payload)) !== entry.sha256) {
+    if (typeof payload !== "string") {
       integrity = false;
       issues.push(`sha256 mismatch for ${entry.path}`);
+      issues.push(`byte-size mismatch for ${entry.path}`);
       continue;
+    }
+    if ((await sha256Hex(payload)) !== entry.sha256) {
+      integrity = false;
+      issues.push(`sha256 mismatch for ${entry.path}`);
+    }
+    if (utf8Size(payload) !== entry.bytes) {
+      integrity = false;
+      issues.push(`byte-size mismatch for ${entry.path}`);
     }
     if (
       (RECORD_PATHS as readonly string[]).includes(entry.path) &&
@@ -284,10 +414,7 @@ export async function verifyExportBundleV2(
   let checkpointOk = checkpointVerdict.valid;
   let dispositionOk = dispositionVerdict.valid;
   let audit = verifyAuditClaim(origin, checkpoints, events, manifest.scope.tenantId, options.retention);
-  let edge =
-    verifyEdgeChain(edges).valid &&
-    recordsMatchTenant(edges, "edge", manifest.scope.tenantId) &&
-    recordsHaveOnlyEnvelopeKeys(edges, EDGE_RECORD_KEYS);
+  let edge = verifyEdgeChain(edges).valid && recordsAreValidEdgeRecords(edges, manifest.scope.tenantId);
   let commit = commits.length === 0 && verifyCommitChain(commits).valid;
   if (unparseable.has("records/retention-checkpoints.jsonl")) checkpointOk = false;
   if (unparseable.has("records/retention-dispositions.jsonl")) dispositionOk = false;
@@ -335,7 +462,7 @@ function trackedRecords(path: string, records: unknown[]): { path: string; conte
 }
 
 /** Computes the format-neutral manifest file-map digest without mutating entries. */
-async function computeV2RootHash(files: ExportBundleFileEntry[]): Promise<string> {
+async function computeV2RootHash(files: ExportBundleV2FileEntry[]): Promise<string> {
   const sorted = [...files].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
   return sha256Hex(canonicalJson(sorted));
 }
@@ -391,8 +518,7 @@ function verifyAuditClaim(
   tenantId: string,
   options: RetentionVerificationOptions = {},
 ): boolean {
-  if (!recordsMatchTenant(events, "event", tenantId)) return false;
-  if (!recordsHaveOnlyEnvelopeKeys(events, AUDIT_RECORD_KEYS)) return false;
+  if (!recordsAreValidAuditRecords(events, tenantId)) return false;
   if (origin.kind === "genesis") {
     try {
       return verifyAuditRecords(events as AuditRecord[]).ok;
@@ -409,30 +535,170 @@ function verifyAuditClaim(
   }
 }
 
-/** Requires every selected record to carry the manifest tenant at its protocol scope. */
-function recordsMatchTenant(records: unknown[], envelope: "event" | "edge", tenantId: string): boolean {
-  return records.every(
-    (record) =>
-      isPlainObject(record) &&
-      isPlainObject(record[envelope]) &&
-      isPlainObject(record[envelope].scope) &&
-      record[envelope].scope.tenantId === tenantId,
+/** Requires every audit envelope and nested event to match the closed public schemas. */
+function recordsAreValidAuditRecords(records: unknown[], tenantId: string): boolean {
+  return records.every((record) => validAuditRecord(record, tenantId));
+}
+
+/** Requires one complete audit-record envelope and its tenant-bound event. */
+function validAuditRecord(value: unknown, tenantId: string): boolean {
+  if (!isPlainObject(value) || !hasExactKeys(value, AUDIT_RECORD_KEYS)) return false;
+  return (
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence >= 1 &&
+    (value.previousHash === null ||
+      (typeof value.previousHash === "string" && HASH_PATTERN.test(value.previousHash))) &&
+    value.hashAlgorithm === "sha256" &&
+    value.canonicalization === "veritio-json-v1" &&
+    validTimestamp(value.appendedAt) &&
+    typeof value.idempotencyKeyHash === "string" &&
+    HASH_PATTERN.test(value.idempotencyKeyHash) &&
+    typeof value.hash === "string" &&
+    HASH_PATTERN.test(value.hash) &&
+    validAuditEvent(value.event, tenantId)
   );
 }
 
-/** Rejects hosted or unknown envelope fields before protocol hash helpers can ignore them. */
-function recordsHaveOnlyEnvelopeKeys(records: unknown[], keys: ReadonlySet<string>): boolean {
-  return records.every((record) => isPlainObject(record) && hasOnlyKeys(record, keys));
+/** Applies event.schema.json, including closed nested actor, target, and scope shapes. */
+function validAuditEvent(value: unknown, tenantId: string): boolean {
+  if (!isPlainObject(value) || !hasOnlyKeys(value, EVENT_KEYS) || !hasAllKeys(value, EVENT_REQUIRED_KEYS)) return false;
+  if (
+    !nonEmpty(value.id) ||
+    value.schemaVersion !== "2026-06-10" ||
+    !validTimestamp(value.occurredAt) ||
+    !validActor(value.actor) ||
+    typeof value.action !== "string" ||
+    !ACTION_PATTERN.test(value.action) ||
+    !validTarget(value.target) ||
+    !validEventScope(value.scope, tenantId) ||
+    !isJsonObject(value.metadata)
+  )
+    return false;
+  if (value.requestId !== undefined && typeof value.requestId !== "string") return false;
+  if (value.purpose !== undefined && typeof value.purpose !== "string") return false;
+  if (value.retention !== undefined && typeof value.retention !== "string") return false;
+  if (value.lawfulBasis !== undefined && !LAWFUL_BASES.has(value.lawfulBasis)) return false;
+  if (value.dataCategories !== undefined) {
+    if (!Array.isArray(value.dataCategories) || value.dataCategories.some((item) => typeof item !== "string"))
+      return false;
+    if (new Set(value.dataCategories).size !== value.dataCategories.length) return false;
+  }
+  return true;
+}
+
+/** Validates the event actor's closed public principal shape. */
+function validActor(value: unknown): boolean {
+  return (
+    isPlainObject(value) &&
+    hasOnlyKeys(value, ACTOR_KEYS) &&
+    hasAllKeys(value, ["type", "id"]) &&
+    ACTOR_TYPES.has(value.type) &&
+    typeof value.id === "string" &&
+    (value.display === undefined || typeof value.display === "string")
+  );
+}
+
+/** Validates the event target's closed public resource shape. */
+function validTarget(value: unknown): boolean {
+  return (
+    isPlainObject(value) &&
+    hasOnlyKeys(value, TARGET_KEYS) &&
+    hasAllKeys(value, ["type", "id"]) &&
+    typeof value.type === "string" &&
+    typeof value.id === "string" &&
+    (value.display === undefined || typeof value.display === "string")
+  );
+}
+
+/** Requires the record-level tenant while preserving the schema's optional scope fields. */
+function validEventScope(value: unknown, tenantId: string): boolean {
+  return (
+    isPlainObject(value) &&
+    hasOnlyKeys(value, EVENT_SCOPE_KEYS) &&
+    nonEmpty(value.tenantId) &&
+    value.tenantId === tenantId &&
+    (value.workspaceId === undefined || typeof value.workspaceId === "string") &&
+    (value.environment === undefined || typeof value.environment === "string")
+  );
+}
+
+/** Requires every edge envelope and nested graph edge to match the closed public schemas. */
+function recordsAreValidEdgeRecords(records: unknown[], tenantId: string): boolean {
+  return records.every((record) => validEdgeRecord(record, tenantId));
+}
+
+/** Requires one complete edge-record envelope and its tenant-bound edge. */
+function validEdgeRecord(value: unknown, tenantId: string): boolean {
+  if (!isPlainObject(value) || !hasExactKeys(value, EDGE_RECORD_KEYS)) return false;
+  return (
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence >= 1 &&
+    (value.previousHash === null ||
+      (typeof value.previousHash === "string" && HASH_PATTERN.test(value.previousHash))) &&
+    value.hashAlgorithm === "sha256" &&
+    value.canonicalization === "veritio-json-v1" &&
+    validTimestamp(value.appendedAt) &&
+    typeof value.idempotencyKeyHash === "string" &&
+    HASH_PATTERN.test(value.idempotencyKeyHash) &&
+    typeof value.hash === "string" &&
+    HASH_PATTERN.test(value.hash) &&
+    validEvidenceEdge(value.edge, tenantId)
+  );
+}
+
+/** Applies edge.schema.json, including closed nested entity and scope shapes. */
+function validEvidenceEdge(value: unknown, tenantId: string): boolean {
+  return (
+    isPlainObject(value) &&
+    hasOnlyKeys(value, EDGE_KEYS) &&
+    hasAllKeys(value, EDGE_REQUIRED_KEYS) &&
+    nonEmpty(value.id) &&
+    value.schemaVersion === "2026-06-13" &&
+    validTimestamp(value.occurredAt) &&
+    validEventScope(value.scope, tenantId) &&
+    validEntity(value.from) &&
+    EDGE_RELATIONS.has(value.relation) &&
+    validEntity(value.to) &&
+    isJsonObject(value.metadata)
+  );
+}
+
+/** Validates a closed evidence-graph entity reference. */
+function validEntity(value: unknown): boolean {
+  return (
+    isPlainObject(value) &&
+    hasOnlyKeys(value, ENTITY_KEYS) &&
+    hasAllKeys(value, ["type", "id"]) &&
+    ENTITY_TYPES.has(value.type) &&
+    nonEmpty(value.id) &&
+    (value.actorType === undefined || ENTITY_ACTOR_TYPES.has(value.actorType)) &&
+    (value.resourceType === undefined || typeof value.resourceType === "string") &&
+    (value.version === undefined || typeof value.version === "string") &&
+    (value.pathHash === undefined || typeof value.pathHash === "string")
+  );
+}
+
+/** Recursively narrows metadata to JSON values without accepting class instances. */
+function isJsonObject(value: unknown): boolean {
+  return isPlainObject(value) && Object.values(value).every((item) => isJsonValue(item));
+}
+
+/** Recursively validates JSON-compatible protocol metadata. */
+function isJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every((item) => isJsonValue(item));
+  return isJsonObject(value);
 }
 
 /** Validates every closed v2 container, manifest, claim, and file-map shape. */
-function verifyV2Shape(bundle: ExportBundleV2, issues: string[]): boolean {
+function verifyV2Shape(bundle: unknown, issues: string[]): bundle is ExportBundleV2 {
   if (!isPlainObject(bundle) || !hasOnlyKeys(bundle, CONTAINER_KEYS) || bundle.bundleVersion !== "vevb-2") {
     issues.push("invalid vevb-2 container shape");
     return false;
   }
-  const manifest = bundle.manifest;
-  const files = bundle.files;
+  const manifest = bundle.manifest as ExportBundleV2Manifest;
+  const files = bundle.files as Record<string, string>;
   let valid = isPlainObject(manifest) && hasOnlyKeys(manifest, MANIFEST_KEYS) && isPlainObject(files);
   if (!valid) {
     issues.push("invalid vevb-2 manifest or files shape");
@@ -457,6 +723,8 @@ function verifyV2Shape(bundle: ExportBundleV2, issues: string[]): boolean {
         !HASH_PATTERN.test(String(entry.sha256)) ||
         !Number.isSafeInteger(entry.records) ||
         entry.records < 0 ||
+        !Number.isSafeInteger(entry.bytes) ||
+        entry.bytes < 0 ||
         paths.includes(entry.path)
       )
         valid = false;
@@ -471,6 +739,8 @@ function verifyV2Shape(bundle: ExportBundleV2, issues: string[]): boolean {
     fileKeys.some((path) => typeof files[path] !== "string")
   )
     valid = false;
+  const verificationEntry = manifest.files.find((entry) => entry.path === "verification.json");
+  if (verificationEntry?.records !== 0) valid = false;
   if (Boolean(bundle.signature) !== Boolean(manifest.signaturePublicKeyFingerprint)) valid = false;
   if (
     manifest.signaturePublicKeyFingerprint !== undefined &&
@@ -574,6 +844,11 @@ function splitRecordLines(payload: string): string[] {
   const lines = payload.split("\n");
   if (lines.at(-1) === "") lines.pop();
   return lines;
+}
+
+/** Counts exact UTF-8 bytes without depending on host filesystem encoding. */
+function utf8Size(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 /** Requires exact canonical JSON per line and the mandatory trailing newline. */
@@ -695,14 +970,30 @@ function hasOnlyKeys(value: object, keys: ReadonlySet<string>): boolean {
   return Object.keys(value).every((key) => keys.has(key));
 }
 
+/** Requires every key in a closed schema set to be present exactly once. */
+function hasExactKeys(value: object, keys: ReadonlySet<string>): boolean {
+  return Object.keys(value).length === keys.size && hasOnlyKeys(value, keys);
+}
+
+/** Requires all schema-mandatory keys while allowing separately checked optionals. */
+function hasAllKeys(value: object, keys: readonly string[]): boolean {
+  return keys.every((key) => Object.hasOwn(value, key));
+}
+
 /** Requires non-empty protocol strings without normalization. */
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-/** Requires a real ISO timestamp while leaving exact bytes caller-owned. */
+/** Requires a real UTC instant rendered with exactly millisecond precision. */
 function validTimestamp(value: unknown): value is string {
-  return typeof value === "string" && Number.isFinite(Date.parse(value));
+  return (
+    typeof value === "string" &&
+    TIMESTAMP_PATTERN.test(value) &&
+    !Number.isNaN(Date.parse(value)) &&
+    !value.startsWith("0000-") &&
+    new Date(value).toISOString() === value
+  );
 }
 
 /** Recognizes the retention verifier's closed signature status set. */

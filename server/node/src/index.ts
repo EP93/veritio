@@ -2434,7 +2434,7 @@ function toolDescription(name: string): string {
     case "veritio.reset_dev_store":
       return "Clear the local development evidence store.";
     case "veritio.create_export_bundle":
-      return "Emit a portable, verifiable vevb-1 evidence export bundle when write tools are enabled.";
+      return "Emit a portable, verifiable evidence export bundle: vevb-1 by default, or vevb-2 only with explicit host-injected checkpoint inputs, when write tools are enabled.";
     default:
       return `Read local evidence through ${name}.`;
   }
