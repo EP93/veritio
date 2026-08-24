@@ -1,0 +1,91 @@
+{
+  "publicKeyHex": "13de4d81961eb2559a0f817f55a532726e6ced904871a271efb3de90ad2156bf",
+  "cases": [
+    {
+      "name": "epoch-one-unsigned",
+      "input": {
+        "checkpointId": "rcp_001",
+        "tenantId": "org_fixture",
+        "chainKind": "audit",
+        "epoch": 1,
+        "fromSequence": 1,
+        "fromPreviousHash": null,
+        "throughSequence": 2,
+        "throughHash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "recordCount": 2,
+        "archiveRootHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "previousCheckpointHash": null,
+        "createdAt": "2026-08-24T00:00:00.000Z"
+      },
+      "expected": {
+        "recordType": "retention.checkpoint",
+        "schemaVersion": "1.0",
+        "checkpointId": "rcp_001",
+        "tenantId": "org_fixture",
+        "chainKind": "audit",
+        "epoch": 1,
+        "fromSequence": 1,
+        "fromPreviousHash": null,
+        "throughSequence": 2,
+        "throughHash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "recordCount": 2,
+        "archiveRootHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "previousCheckpointHash": null,
+        "createdAt": "2026-08-24T00:00:00.000Z",
+        "canonicalization": "veritio-json-v1",
+        "hashAlgorithm": "sha256",
+        "hash": "673dc45f77a9358388150de8c8525794dd9e72e5bd4e02fc648cb62e6df91dfb"
+      }
+    },
+    {
+      "name": "epoch-two-signed",
+      "input": {
+        "checkpointId": "rcp_002",
+        "tenantId": "org_fixture",
+        "chainKind": "audit",
+        "epoch": 2,
+        "fromSequence": 3,
+        "fromPreviousHash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "throughSequence": 3,
+        "throughHash": "3333333333333333333333333333333333333333333333333333333333333333",
+        "recordCount": 1,
+        "archiveRootHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "previousCheckpointHash": "673dc45f77a9358388150de8c8525794dd9e72e5bd4e02fc648cb62e6df91dfb",
+        "createdAt": "2026-08-24T00:00:01.000Z",
+        "signaturePublicKeyFingerprint": "85738febb9b65976ce362021ac8b8a2d1e7854d64bfbd5af4b68a1c6b4c4bb14"
+      },
+      "signature": {
+        "algorithm": "ed25519",
+        "publicKeyFingerprint": "85738febb9b65976ce362021ac8b8a2d1e7854d64bfbd5af4b68a1c6b4c4bb14",
+        "signature": "nAJCzUvKimoaYsgsveoqeKxzIkJ3VsTX+UJrRzTcnGrzw+Kk1/NWYKOjiM3XdIoUeCkWj0dkpn64TIJDSf5vDg=="
+      },
+      "expectedHash": "3671fc9e26e049bec98900fd1cb0d58f262396ceffebf3854ba71f864d89cd4f"
+    }
+  ],
+  "constructorRejections": [
+    { "name": "invalid-id", "field": "checkpointId", "value": "rcp invalid" },
+    { "name": "unsafe-integer", "field": "throughSequence", "value": 9007199254740992 },
+    { "name": "extra-timestamp-precision", "field": "createdAt", "value": "2026-08-24T00:00:00.0001Z" }
+  ],
+  "retainedRecords": [
+    {
+      "event": {
+        "id": "evt_retained_003",
+        "schemaVersion": "2026-06-10",
+        "occurredAt": "2026-08-24T00:02:00.000Z",
+        "actor": { "type": "system", "id": "retention_fixture" },
+        "action": "retention.tail.retained",
+        "target": { "type": "record", "id": "rec_003" },
+        "scope": { "tenantId": "org_fixture" },
+        "metadata": {}
+      },
+      "sequence": 3,
+      "previousHash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "hashAlgorithm": "sha256",
+      "canonicalization": "veritio-json-v1",
+      "appendedAt": "2026-08-24T00:02:01.000Z",
+      "idempotencyKeyHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "hash": "6417b8916ca4224a860e9b7ba9870e6ab34c30772f029775ff1fb9af88b11f3a"
+    }
+  ]
+}
