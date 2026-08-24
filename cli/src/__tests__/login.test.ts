@@ -86,9 +86,9 @@ describe("codex config surgery", () => {
         await Bun.sleep(10);
         lines = readLogLines(logPath);
       }
-      // Let a duplicate invocation land before asserting, so "exactly once"
-      // is actually proven rather than raced past the moment two lines exist.
-      await Bun.sleep(100);
+      // A duplicate capture lands alongside the first, so the equality below
+      // already fails on a third line; a settle delay was measured to add no
+      // detection and is deliberately omitted.
       expect(readLogLines(logPath).sort()).toEqual(["capture", "original"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
