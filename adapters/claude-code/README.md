@@ -53,7 +53,7 @@ The hook always exits `0` — a logging hook never blocks the agent.
 
 Install an exact reviewed version in repositories and hosted runners; do not
 use an unversioned `bunx` command. The bundled plugin pins
-`@veritio/claude-code@0.4.7`. Treat it as unavailable until exact registry
+`@veritio/claude-code@0.4.8`. Treat it as unavailable until exact registry
 readback succeeds; the plugin must fail closed rather than fall back to 0.4.5.
 
 The `veritio` CLI device-login helper is not published yet. From a repository

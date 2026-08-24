@@ -2253,3 +2253,4 @@ export * from "./object-archive.js";
 export * from "./outbox.js";
 export * from "./retention-coordinator.js";
 export * from "./retention-staging-archive.js";
+export * from "./version.js";

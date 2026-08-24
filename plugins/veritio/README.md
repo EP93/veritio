@@ -44,7 +44,7 @@ Code's built-in OAuth (approve it once in `/mcp`).
 | `Stop` | `git status` turn-scan for Bash-driven file changes |
 | `SessionEnd` | finalizes session state |
 
-Capture is pinned to the reviewed `@veritio/claude-code@0.4.7` via `bunx`; it
+Capture is pinned to the reviewed `@veritio/claude-code@0.4.8` via `bunx`; it
 does not resolve npm latest for every hook. The credentials come from the env
 written by a repository-checkout `veritio login` (the CLI is not published;
 only after this exact package is published and verified from the registry; an

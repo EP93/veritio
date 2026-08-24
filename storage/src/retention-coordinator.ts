@@ -1,8 +1,8 @@
 import {
-  canonicalJson,
   type AuditChainState,
   type AuditRecord,
   type CheckpointingAuditStore,
+  canonicalJson,
   type RetentionCheckpoint,
   type RetentionCheckpointInput,
   type RetentionDisposition,
@@ -11,13 +11,25 @@ import {
   verifyRetentionCheckpoint,
   verifyRetentionDisposition,
 } from "@veritio/core";
-import type {
-  RetentionStagingArchive,
-  RetentionStagingManifest,
-} from "./retention-staging-archive.js";
+import type { RetentionStagingArchive, RetentionStagingManifest } from "./retention-staging-archive.js";
 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const POLICY_REFERENCE_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/;
+const TIMESTAMP_PATTERN = /^\d{4}-(0[1-9]|1[0-2])-([0-2]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d\.\d{3}Z$/;
+
+/**
+ * Public feature identity for hosts that must fail closed unless the installed
+ * storage package resolves disposal time after confirmed provider absence and
+ * replays accepted receipts without consulting a clock again.
+ */
+export const RETENTION_COORDINATOR_CAPABILITY = Object.freeze({
+  api: "runRetentionEpoch",
+  apiVersion: "1.0",
+  protocol: "veritio.retention",
+  schemaVersion: "1.0",
+  resolvesDisposedAtAfterConfirmedAbsence: true,
+  replaysAcceptedDispositionWithoutResolvingDisposedAt: true,
+} as const);
 
 /**
  * Current host authorization for exactly one retention policy version. The
@@ -36,10 +48,7 @@ export interface RetentionEligibilityDecision {
  * The OSS coordinator can enforce callback scope but cannot prove the host's
  * callback actually locks or serializes external hold mutations.
  */
-export type RetentionPolicyFenceRunner = <T>(
-  expectedVersion: number,
-  operation: () => Promise<T>,
-) => Promise<T>;
+export type RetentionPolicyFenceRunner = <T>(expectedVersion: number, operation: () => Promise<T>) => Promise<T>;
 
 /**
  * Host-owned tenant/chain serialization boundary for a complete retention
@@ -56,12 +65,27 @@ export interface RetentionCheckpointFactoryInput {
   createdAt: string;
 }
 
-/** Caller-owned attempt/receipt identifiers and exact UTC-millisecond disposal time. */
+/** Caller-owned attempt and receipt identifiers; disposal time is resolved only after confirmed absence. */
 export interface RetentionDispositionFactoryInput {
   attemptId: string;
   dispositionId: string;
-  disposedAt: string;
 }
+
+/**
+ * Privacy-minimal host-clock context delivered only after provider deletion and
+ * both direct-object and prefix absence checks succeed. The checkpoint is a
+ * detached clone so host callbacks cannot mutate coordinator state.
+ */
+export interface ResolveRetentionDisposedAtContext {
+  readonly tenantId: string;
+  readonly checkpoint: RetentionCheckpoint;
+  readonly attemptId: string;
+  readonly dispositionId: string;
+  readonly policyFence: number;
+}
+
+/** Host-injected trusted clock boundary; core and storage never read host time or environment state. */
+export type RetentionDisposedAtResolver = (context: ResolveRetentionDisposedAtContext) => Promise<string>;
 
 /**
  * Complete injected inputs for one audit-retention epoch. Core receives no
@@ -77,6 +101,7 @@ export interface RunRetentionEpochOptions {
   eligibility: RetentionEligibilityDecision;
   checkpoint: RetentionCheckpointFactoryInput;
   disposition: RetentionDispositionFactoryInput;
+  resolveDisposedAt: RetentionDisposedAtResolver;
   segmentRecordCount?: number;
   createCheckpoint(input: RetentionCheckpointInput): RetentionCheckpoint;
   createDisposition(input: RetentionDispositionInput): RetentionDisposition;
@@ -112,9 +137,7 @@ export async function runRetentionEpoch(options: RunRetentionEpochOptions): Prom
  * held across every disposal operation. Byte-identical completed stages replay
  * idempotently while the outer lease prevents concurrent restaging races.
  */
-async function runRetentionEpochUnderLease(
-  options: RunRetentionEpochOptions,
-): Promise<RunRetentionEpochResult> {
+async function runRetentionEpochUnderLease(options: RunRetentionEpochOptions): Promise<RunRetentionEpochResult> {
   validateCoordinatorInputs(options);
   const epoch = (options.previousCheckpoint?.epoch ?? 0) + 1;
   const preflightCheckpoints = await options.store.listCheckpoints({ tenantId: options.tenantId });
@@ -165,15 +188,10 @@ async function runRetentionEpochUnderLease(
     assertVerifiedCheckpoint(checkpoint, options.verification);
   }
 
-  const preflightDisposition = preflightDispositions.find(
-    (candidate) => candidate.checkpointHash === checkpoint.hash,
-  );
+  const preflightDisposition = preflightDispositions.find((candidate) => candidate.checkpointHash === checkpoint.hash);
   if (preflightDisposition) {
     if (!preflightCheckpoint) throw new TypeError("retention disposition checkpoint is missing");
-    const expectedReceipt = createAndVerifyDisposition(options, checkpoint);
-    if (canonicalJson(preflightDisposition) !== canonicalJson(expectedReceipt)) {
-      throw new TypeError("retention disposition replay conflict");
-    }
+    assertAcceptedDispositionBinding(options, checkpoint, preflightDisposition);
     if (!(await options.archive.confirmCheckpointEpochAbsent(checkpoint))) {
       throw new TypeError("staged retention epoch is present after confirmed disposition");
     }
@@ -236,10 +254,7 @@ async function runRetentionEpochUnderLease(
       (candidate) => candidate.checkpointHash === checkpoint.hash,
     );
     if (accepted) {
-      const expectedReceipt = createAndVerifyDisposition(options, checkpoint);
-      if (canonicalJson(accepted) !== canonicalJson(expectedReceipt)) {
-        throw new TypeError("retention disposition replay conflict");
-      }
+      assertAcceptedDispositionBinding(options, checkpoint, accepted);
       if (!(await options.archive.confirmCheckpointEpochAbsent(checkpoint))) {
         throw new TypeError("staged retention epoch is present after confirmed disposition");
       }
@@ -275,7 +290,15 @@ async function runRetentionEpochUnderLease(
     if (!deletionConfirmed) {
       throw new TypeError("staged retention epoch deletion is unconfirmed");
     }
-    const receipt = createAndVerifyDisposition(options, checkpoint);
+    const disposedAt = await options.resolveDisposedAt({
+      tenantId: options.tenantId,
+      checkpoint: cloneCheckpoint(checkpoint),
+      attemptId: options.disposition.attemptId,
+      dispositionId: options.disposition.dispositionId,
+      policyFence: options.eligibility.version,
+    });
+    assertExactUtcMillisecond(disposedAt, "disposedAt");
+    const receipt = createAndVerifyDisposition(options, checkpoint, disposedAt);
     await options.store.confirmDisposition(
       { tenantId: options.tenantId },
       receipt,
@@ -296,6 +319,7 @@ async function runRetentionEpochUnderLease(
 function createAndVerifyDisposition(
   options: RunRetentionEpochOptions,
   checkpoint: RetentionCheckpoint,
+  disposedAt: string,
 ): RetentionDisposition {
   const input: RetentionDispositionInput = {
     dispositionId: options.disposition.dispositionId,
@@ -306,7 +330,7 @@ function createAndVerifyDisposition(
     throughSequence: checkpoint.throughSequence,
     archiveRootHash: checkpoint.archiveRootHash,
     policyReference: options.eligibility.policyReference,
-    disposedAt: options.disposition.disposedAt,
+    disposedAt,
   };
   const receipt = options.createDisposition(input);
   assertDispositionFactoryBinding(receipt, input);
@@ -324,8 +348,46 @@ function validateCoordinatorInputs(options: RunRetentionEpochOptions): void {
   assertId(options.checkpoint.checkpointId, "checkpointId");
   assertId(options.disposition.attemptId, "attemptId");
   assertId(options.disposition.dispositionId, "dispositionId");
+  if (typeof options.resolveDisposedAt !== "function") throw new TypeError("resolveDisposedAt is required");
   if (options.previousCheckpoint !== null && options.previousCheckpoint.tenantId !== options.tenantId) {
     throw new TypeError("previous checkpoint tenant mismatch");
+  }
+}
+
+/**
+ * Verifies an accepted authoritative receipt and its caller-visible binding
+ * without reconstructing it or consulting the host clock during replay.
+ */
+function assertAcceptedDispositionBinding(
+  options: RunRetentionEpochOptions,
+  checkpoint: RetentionCheckpoint,
+  receipt: RetentionDisposition,
+): void {
+  const verification = verifyRetentionDisposition(receipt, checkpoint, options.verification ?? {});
+  if (!verification.ok) throw new TypeError(`invalid retention disposition: ${verification.reason}`);
+  const bound =
+    receipt.dispositionId === options.disposition.dispositionId &&
+    receipt.tenantId === options.tenantId &&
+    receipt.chainKind === "audit" &&
+    receipt.checkpointHash === checkpoint.hash &&
+    receipt.fromSequence === checkpoint.fromSequence &&
+    receipt.throughSequence === checkpoint.throughSequence &&
+    receipt.archiveRootHash === checkpoint.archiveRootHash &&
+    receipt.policyReference === options.eligibility.policyReference &&
+    receipt.method === "provider-delete";
+  if (!bound) throw new TypeError("retention disposition replay conflict");
+}
+
+/** Mirrors the protocol timestamp grammar so invalid host-clock output fails before receipt creation. */
+function assertExactUtcMillisecond(value: unknown, field: string): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    !TIMESTAMP_PATTERN.test(value) ||
+    Number.isNaN(Date.parse(value)) ||
+    value.startsWith("0000-") ||
+    new Date(value).toISOString() !== value
+  ) {
+    throw new TypeError(`${field} must be exact UTC milliseconds`);
   }
 }
 
@@ -401,10 +463,7 @@ function assertVerifiedCheckpoint(
 }
 
 /** Ensures a host signing callback changes only optional signature fields, never coordinator-owned binding fields. */
-function assertCheckpointFactoryBinding(
-  checkpoint: RetentionCheckpoint,
-  input: RetentionCheckpointInput,
-): void {
+function assertCheckpointFactoryBinding(checkpoint: RetentionCheckpoint, input: RetentionCheckpointInput): void {
   const bound =
     checkpoint.checkpointId === input.checkpointId &&
     checkpoint.tenantId === input.tenantId &&
@@ -422,10 +481,7 @@ function assertCheckpointFactoryBinding(
 }
 
 /** Ensures receipt creation cannot add or alter range, tenant, policy, provider method, or time bindings. */
-function assertDispositionFactoryBinding(
-  receipt: RetentionDisposition,
-  input: RetentionDispositionInput,
-): void {
+function assertDispositionFactoryBinding(receipt: RetentionDisposition, input: RetentionDispositionInput): void {
   const bound =
     receipt.dispositionId === input.dispositionId &&
     receipt.tenantId === input.tenantId &&

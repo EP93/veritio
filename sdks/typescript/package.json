@@ -1,6 +1,6 @@
 {
   "name": "@veritio/core",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Protocol-first TypeScript SDK for application audit trails, consent history, retention, and data subject workflow evidence.",
   "homepage": "https://getveritio.com",
   "license": "Apache-2.0",
@@ -30,6 +30,11 @@
       "types": "./dist/risk-score.d.ts",
       "import": "./dist/risk-score.js",
       "default": "./dist/risk-score.js"
+    },
+    "./version": {
+      "types": "./dist/version.d.ts",
+      "import": "./dist/version.js",
+      "default": "./dist/version.js"
     }
   },
   "files": [

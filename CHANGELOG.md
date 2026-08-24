@@ -4,6 +4,35 @@ All notable changes to Veritio will be documented in this file.
 
 Veritio is a pre-1.0 Apache-2.0 project. Early releases may change APIs while the protocol, SDKs, adapters, and storage contracts settle. Release notes should be explicit about migration steps and should avoid legal-compliance guarantees.
 
+## [0.4.8] - 2026-08-25
+
+### Added
+
+- `@veritio/core/version` and `@veritio/storage/version` expose immutable exact
+  package identity tokens for server hosts that cannot read package metadata.
+- `@veritio/storage/retention` exposes a frozen retention-coordinator
+  capability token with explicit API/protocol/schema identity and fail-closed
+  feature flags for confirmed-disposal-time and accepted cold replay behavior.
+
+### Changed
+
+- The first public retention coordinator contract resolves `disposedAt` through
+  an asynchronous host callback only after staged deletion and direct-plus-prefix
+  absence confirmation. Existing accepted receipts replay byte-for-byte without
+  consulting the callback; deletion, absence, callback, and timestamp failures
+  persist no receipt.
+- Released `@veritio/core`, `@veritio/storage`, and `@veritio/claude-code`
+  0.4.8 as one train. Claude Code pins core and storage exactly at 0.4.8, and
+  all seven plugin hooks pin the exact Claude Code package version. Independent
+  framework adapters remain on their own release cadence.
+
+### Safety
+
+- Disposal-time callback context is limited to tenant id, a detached checkpoint,
+  attempt id, disposition id, and opaque policy fence. The OSS packages do not
+  read host environment or clock state and make no claim about provider backups
+  or legal compliance.
+
 ## [0.4.7] - 2026-08-23
 
 ### Added

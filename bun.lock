@@ -27,14 +27,14 @@
     },
     "adapters/claude-code": {
       "name": "@veritio/claude-code",
-      "version": "0.4.7",
+      "version": "0.4.8",
       "bin": {
         "veritio-claude-code-hook": "dist/hook.js",
         "veritio-claude-code-mcp": "dist/mcp.js",
       },
       "dependencies": {
-        "@veritio/core": "0.4.7",
-        "@veritio/storage": "0.4.7",
+        "@veritio/core": "0.4.8",
+        "@veritio/storage": "0.4.8",
       },
     },
     "adapters/codex": {
@@ -175,7 +175,7 @@
     },
     "sdks/typescript": {
       "name": "@veritio/core",
-      "version": "0.4.7",
+      "version": "0.4.8",
     },
     "server/node": {
       "name": "@veritio/server",
@@ -186,7 +186,7 @@
     },
     "storage": {
       "name": "@veritio/storage",
-      "version": "0.4.7",
+      "version": "0.4.8",
       "devDependencies": {
         "@veritio/core": "workspace:*",
         "mongodb": "^7.3.0",

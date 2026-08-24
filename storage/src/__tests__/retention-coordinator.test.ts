@@ -1,19 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
+  type CheckpointingAuditStore,
   canonicalJson,
   createAuditEvent,
   createRetentionCheckpoint,
   createRetentionDisposition,
   MemoryAuditStore,
-  type CheckpointingAuditStore,
   type RetentionCheckpointInput,
+  type RetentionDisposition,
   type RetentionDispositionInput,
 } from "@veritio/core";
-import {
-  createRetentionStagingArchive,
-  type RetentionStagingClient,
-} from "../retention-staging-archive";
-import { runRetentionEpoch, type RetentionPolicyFenceRunner } from "../retention-coordinator";
+import { type RetentionPolicyFenceRunner, runRetentionEpoch } from "../retention-coordinator";
+import { createRetentionStagingArchive, type RetentionStagingClient } from "../retention-staging-archive";
 
 const TENANT_ID = "org_coordinator";
 
@@ -21,15 +19,17 @@ const TENANT_ID = "org_coordinator";
 async function seedStore(count = 3): Promise<MemoryAuditStore> {
   const store = new MemoryAuditStore();
   for (let index = 1; index <= count; index += 1) {
-    await store.append(createAuditEvent({
-      id: `evt_${index}`,
-      occurredAt: "2026-08-24T01:00:00.000Z",
-      actor: { type: "system", id: "coordinator-test" },
-      action: "retention.tested",
-      target: { type: "organization", id: TENANT_ID },
-      scope: { tenantId: TENANT_ID, environment: "test" },
-      metadata: { index },
-    }));
+    await store.append(
+      createAuditEvent({
+        id: `evt_${index}`,
+        occurredAt: "2026-08-24T01:00:00.000Z",
+        actor: { type: "system", id: "coordinator-test" },
+        action: "retention.tested",
+        target: { type: "organization", id: TENANT_ID },
+        scope: { tenantId: TENANT_ID, environment: "test" },
+        metadata: { index },
+      }),
+    );
   }
   return store;
 }
@@ -68,7 +68,11 @@ function createClient(log: string[]): RetentionStagingClient & {
 }
 
 /** Delegates to a real store while logging only destructive coordinator boundaries. */
-function loggedStore(store: CheckpointingAuditStore, log: string[], isFenceHeld: () => boolean): CheckpointingAuditStore {
+function loggedStore(
+  store: CheckpointingAuditStore,
+  log: string[],
+  isFenceHeld: () => boolean,
+): CheckpointingAuditStore {
   return {
     append: store.append.bind(store),
     list: store.list.bind(store),
@@ -94,8 +98,12 @@ function loggedStore(store: CheckpointingAuditStore, log: string[], isFenceHeld:
   };
 }
 
-/** Builds the exact caller-owned IDs, times, policy, and signing factories for one run. */
-async function runOptions(store: CheckpointingAuditStore, client: RetentionStagingClient, overrides: Record<string, unknown> = {}) {
+/** Builds exact caller-owned IDs, policy, trusted clock, and signing factories for one run. */
+async function runOptions(
+  store: CheckpointingAuditStore,
+  client: RetentionStagingClient,
+  overrides: Record<string, unknown> = {},
+) {
   const state = await store.getChainState({ tenantId: TENANT_ID });
   const records = await store.list({ tenantId: TENANT_ID });
   return {
@@ -110,8 +118,8 @@ async function runOptions(store: CheckpointingAuditStore, client: RetentionStagi
     disposition: {
       attemptId: "attempt_run",
       dispositionId: "rdp_run",
-      disposedAt: "2026-08-24T01:02:00.000Z",
     },
+    resolveDisposedAt: async () => "2026-08-24T01:02:00.000Z",
     createCheckpoint: (input: RetentionCheckpointInput) => createRetentionCheckpoint(input),
     createDisposition: (input: RetentionDispositionInput) => createRetentionDisposition(input),
     withEpochLease: async <T>(operation: () => Promise<T>) => operation(),
@@ -167,11 +175,23 @@ describe("retention coordinator", () => {
         log.push("disposition.create");
         return createRetentionDisposition(input);
       },
+      resolveDisposedAt: async (context: unknown) => {
+        expect(fenceHeld).toBe(true);
+        log.push("disposedAt.resolve");
+        expect(context).toEqual({
+          tenantId: TENANT_ID,
+          checkpoint: expect.any(Object),
+          attemptId: "attempt_run",
+          dispositionId: "rdp_run",
+          policyFence: 0,
+        });
+        return "2026-08-24T01:02:00.000Z";
+      },
     });
 
     const result = await runRetentionEpoch(options);
 
-    expect((await realStore.list({ tenantId: TENANT_ID }))).toEqual([]);
+    expect(await realStore.list({ tenantId: TENANT_ID })).toEqual([]);
     expect(await realStore.listCheckpoints({ tenantId: TENANT_ID })).toEqual([result.checkpoint]);
     expect(await realStore.listDispositions({ tenantId: TENANT_ID })).toEqual([result.disposition]);
     if (!result.manifest) throw new Error("initial retention run must return its staged manifest");
@@ -185,6 +205,7 @@ describe("retention coordinator", () => {
     const prepare = log.indexOf("store.prepare");
     const firstDelete = log.indexOf("archive.delete");
     const receipt = log.indexOf("disposition.create");
+    const resolveDisposedAt = log.indexOf("disposedAt.resolve");
     const lastGet = log.slice(0, receipt).lastIndexOf("archive.get");
     const lastList = log.slice(0, receipt).lastIndexOf("archive.list");
     const confirm = log.indexOf("store.confirm");
@@ -197,7 +218,147 @@ describe("retention coordinator", () => {
     expect(firstDelete).toBeLessThan(lastList);
     expect(lastGet).toBeLessThan(receipt);
     expect(lastList).toBeLessThan(receipt);
+    expect(lastGet).toBeLessThan(resolveDisposedAt);
+    expect(lastList).toBeLessThan(resolveDisposedAt);
+    expect(resolveDisposedAt).toBeLessThan(receipt);
     expect(receipt).toBeLessThan(confirm);
+  });
+
+  test("resolves the confirmed disposal time exactly once with a detached privacy-minimal context", async () => {
+    const log: string[] = [];
+    const store = await seedStore();
+    const client = createClient(log);
+    let calls = 0;
+    let callbackCheckpointId = "";
+    const options = await runOptions(store, client, {
+      resolveDisposedAt: async (context: {
+        tenantId: string;
+        checkpoint: RetentionCheckpointInput;
+        attemptId: string;
+        dispositionId: string;
+        policyFence: number;
+      }) => {
+        calls += 1;
+        expect(Object.keys(context).sort()).toEqual([
+          "attemptId",
+          "checkpoint",
+          "dispositionId",
+          "policyFence",
+          "tenantId",
+        ]);
+        expect(context.tenantId).toBe(TENANT_ID);
+        expect(context.attemptId).toBe("attempt_run");
+        expect(context.dispositionId).toBe("rdp_run");
+        expect(context.policyFence).toBe(0);
+        callbackCheckpointId = context.checkpoint.checkpointId;
+        context.checkpoint.checkpointId = "callback-mutation";
+        return "2026-08-24T01:02:00.000Z";
+      },
+    });
+
+    const result = await runRetentionEpoch(options);
+
+    expect(calls).toBe(1);
+    expect(callbackCheckpointId).toBe("rcp_run");
+    expect(result.checkpoint.checkpointId).toBe("rcp_run");
+    expect(result.disposition.disposedAt).toBe("2026-08-24T01:02:00.000Z");
+  });
+
+  test("does not resolve disposal time when deletion or absence confirmation fails", async () => {
+    const deleteLog: string[] = [];
+    const deleteStore = await seedStore();
+    const deleteClient = createClient(deleteLog);
+    deleteClient.failNextDelete = true;
+    let deleteResolverCalls = 0;
+    const deleteOptions = await runOptions(deleteStore, deleteClient, {
+      resolveDisposedAt: async () => {
+        deleteResolverCalls += 1;
+        return "2026-08-24T01:02:00.000Z";
+      },
+    });
+    await expect(runRetentionEpoch(deleteOptions)).rejects.toThrow("crash during delete");
+    expect(deleteResolverCalls).toBe(0);
+
+    const absenceLog: string[] = [];
+    const absenceStore = await seedStore();
+    const absenceClient = createClient(absenceLog);
+    let absenceResolverCalls = 0;
+    const absenceOptions = await runOptions(absenceStore, absenceClient, {
+      resolveDisposedAt: async () => {
+        absenceResolverCalls += 1;
+        return "2026-08-24T01:02:00.000Z";
+      },
+    });
+    absenceOptions.archive = {
+      ...absenceOptions.archive,
+      async confirmEpochAbsent() {
+        return false;
+      },
+    };
+    await expect(runRetentionEpoch(absenceOptions)).rejects.toThrow("staged retention epoch deletion is unconfirmed");
+    expect(absenceResolverCalls).toBe(0);
+  });
+
+  test("fails closed when disposal-time resolution rejects or returns a non-exact UTC-millisecond instant", async () => {
+    const failingStore = await seedStore();
+    const failingClient = createClient([]);
+    const failingOptions = await runOptions(failingStore, failingClient, {
+      resolveDisposedAt: async () => {
+        throw new Error("trusted clock unavailable");
+      },
+    });
+    await expect(runRetentionEpoch(failingOptions)).rejects.toThrow("trusted clock unavailable");
+    expect(await failingStore.listDispositions({ tenantId: TENANT_ID })).toEqual([]);
+
+    for (const invalid of ["2026-08-24T01:02:00Z", "2026-02-30T01:02:00.000Z", "not-a-time", 42]) {
+      const store = await seedStore();
+      const client = createClient([]);
+      const options = await runOptions(store, client, {
+        resolveDisposedAt: async () => invalid,
+      });
+      await expect(runRetentionEpoch(options)).rejects.toThrow("disposedAt must be exact UTC milliseconds");
+      expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([]);
+    }
+  });
+
+  test("rejects mismatched prepared attempts and disposition factory bindings", async () => {
+    const attemptStore = await seedStore();
+    const attemptClient = createClient([]);
+    const baseAttemptOptions = await runOptions(attemptStore, attemptClient);
+    const mismatchedAttemptStore: CheckpointingAuditStore = {
+      ...attemptStore,
+      append: attemptStore.append.bind(attemptStore),
+      list: attemptStore.list.bind(attemptStore),
+      getChainState: attemptStore.getChainState.bind(attemptStore),
+      advanceRetentionPolicyFence: attemptStore.advanceRetentionPolicyFence.bind(attemptStore),
+      compactRange: attemptStore.compactRange.bind(attemptStore),
+      listCheckpoints: attemptStore.listCheckpoints.bind(attemptStore),
+      listDispositions: attemptStore.listDispositions.bind(attemptStore),
+      confirmDisposition: attemptStore.confirmDisposition.bind(attemptStore),
+      async prepareDisposition(...args) {
+        const attempt = await attemptStore.prepareDisposition(...args);
+        return { ...attempt, attemptId: "attempt_wrong" };
+      },
+    };
+    await expect(runRetentionEpoch({ ...baseAttemptOptions, store: mismatchedAttemptStore })).rejects.toThrow(
+      "prepared disposition attempt binding mismatch",
+    );
+
+    const mutations: Array<(input: RetentionDispositionInput) => RetentionDispositionInput> = [
+      (input) => ({ ...input, dispositionId: "rdp_wrong" }),
+      (input) => ({ ...input, policyReference: "policy.wrong" }),
+      (input) => ({ ...input, fromSequence: input.fromSequence + 1 }),
+      (input) => ({ ...input, checkpointHash: "f".repeat(64) }),
+    ];
+    for (const mutate of mutations) {
+      const store = await seedStore();
+      const client = createClient([]);
+      const options = await runOptions(store, client, {
+        createDisposition: (input: RetentionDispositionInput) => createRetentionDisposition(mutate(input)),
+      });
+      await expect(runRetentionEpoch(options)).rejects.toThrow();
+      expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([]);
+    }
   });
 
   test("does not enter the crop fence when archive verification fails", async () => {
@@ -223,7 +384,7 @@ describe("retention coordinator", () => {
 
     await expect(runRetentionEpoch(options)).rejects.toThrow("staged retention epoch verification failed");
     expect(fenceCalls).toBe(0);
-    expect((await store.list({ tenantId: TENANT_ID }))).toHaveLength(3);
+    expect(await store.list({ tenantId: TENANT_ID })).toHaveLength(3);
     expect(await store.listCheckpoints({ tenantId: TENANT_ID })).toEqual([]);
   });
 
@@ -245,7 +406,7 @@ describe("retention coordinator", () => {
     });
 
     await expect(runRetentionEpoch(options)).rejects.toThrow("eligibility version changed");
-    expect((await store.list({ tenantId: TENANT_ID }))).toEqual([]);
+    expect(await store.list({ tenantId: TENANT_ID })).toEqual([]);
     expect(await store.listCheckpoints({ tenantId: TENANT_ID })).toHaveLength(1);
     expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([]);
     expect(log).not.toContain("archive.delete");
@@ -314,14 +475,64 @@ describe("retention coordinator", () => {
     expect(client.objects.size).toBe(0);
     log.length = 0;
 
-    const replayed = await runRetentionEpoch(options);
+    let replayResolverCalls = 0;
+    const replayed = await runRetentionEpoch({
+      ...options,
+      resolveDisposedAt: async () => {
+        replayResolverCalls += 1;
+        throw new Error("accepted replay must not resolve time");
+      },
+    });
 
     expect(replayed.manifest).toBeNull();
+    expect(replayResolverCalls).toBe(0);
     expect(replayed.checkpoint).toEqual(first.checkpoint);
     expect(replayed.disposition).toEqual(first.disposition);
+    expect(canonicalJson(replayed.disposition)).toBe(canonicalJson(first.disposition));
     expect(log).not.toContain("archive.put");
     expect(client.objects.size).toBe(0);
     expect(await store.listDispositions({ tenantId: TENANT_ID })).toEqual([first.disposition]);
+  });
+
+  test("accepted replay rejects disposition, policy, range, or record-hash drift without resolving time", async () => {
+    const receiptMutations = [
+      (receipt: RetentionDisposition) => ({ ...receipt, dispositionId: "rdp_wrong" }),
+      (receipt: RetentionDisposition) => ({ ...receipt, policyReference: "policy.wrong" }),
+      (receipt: RetentionDisposition) => ({ ...receipt, fromSequence: receipt.fromSequence + 1 }),
+      (receipt: RetentionDisposition) => ({ ...receipt, hash: "f".repeat(64) }),
+    ];
+    for (const mutate of receiptMutations) {
+      const store = await seedStore();
+      const client = createClient([]);
+      const options = await runOptions(store, client);
+      const first = await runRetentionEpoch(options);
+      const replayStore: CheckpointingAuditStore = {
+        ...store,
+        append: store.append.bind(store),
+        list: store.list.bind(store),
+        getChainState: store.getChainState.bind(store),
+        advanceRetentionPolicyFence: store.advanceRetentionPolicyFence.bind(store),
+        compactRange: store.compactRange.bind(store),
+        listCheckpoints: store.listCheckpoints.bind(store),
+        prepareDisposition: store.prepareDisposition.bind(store),
+        confirmDisposition: store.confirmDisposition.bind(store),
+        async listDispositions() {
+          return [mutate(first.disposition)];
+        },
+      };
+      let resolverCalls = 0;
+      await expect(
+        runRetentionEpoch({
+          ...options,
+          store: replayStore,
+          resolveDisposedAt: async () => {
+            resolverCalls += 1;
+            return "2026-08-24T01:03:00.000Z";
+          },
+        }),
+      ).rejects.toThrow();
+      expect(resolverCalls).toBe(0);
+    }
   });
 
   test("a crash after confirmed provider absence retries receipt confirmation without re-upload", async () => {
@@ -504,13 +715,15 @@ describe("retention coordinator", () => {
     };
     providerLog.length = 0;
 
-    await expect(runRetentionEpoch({
-      ...base,
-      store: observedStore,
-      withEpochLease: async () => {
-        throw new Error("epoch lease unavailable");
-      },
-    })).rejects.toThrow("epoch lease unavailable");
+    await expect(
+      runRetentionEpoch({
+        ...base,
+        store: observedStore,
+        withEpochLease: async () => {
+          throw new Error("epoch lease unavailable");
+        },
+      }),
+    ).rejects.toThrow("epoch lease unavailable");
 
     expect(storeLog).toEqual([]);
     expect(providerLog).toEqual([]);
@@ -535,8 +748,8 @@ describe("retention coordinator", () => {
       disposition: {
         attemptId: "attempt_retry",
         dispositionId: "rdp_retry",
-        disposedAt: "2026-08-24T01:03:00.000Z",
       },
+      resolveDisposedAt: async () => "2026-08-24T01:03:00.000Z",
     });
     const result = await runRetentionEpoch(retry);
 
@@ -590,7 +803,7 @@ describe("retention coordinator", () => {
     });
 
     await expect(runRetentionEpoch(options)).rejects.toThrow("invalid retention checkpoint: signature_required");
-    expect((await store.list({ tenantId: TENANT_ID }))).toHaveLength(3);
+    expect(await store.list({ tenantId: TENANT_ID })).toHaveLength(3);
     expect(await store.listCheckpoints({ tenantId: TENANT_ID })).toEqual([]);
   });
 
@@ -599,10 +812,11 @@ describe("retention coordinator", () => {
     const store = await seedStore();
     const client = createClient(log);
     const invalid = await runOptions(store, client, {
-      createCheckpoint: (input: RetentionCheckpointInput) => createRetentionCheckpoint({
-        ...input,
-        archiveRootHash: "f".repeat(64),
-      }),
+      createCheckpoint: (input: RetentionCheckpointInput) =>
+        createRetentionCheckpoint({
+          ...input,
+          archiveRootHash: "f".repeat(64),
+        }),
     });
     await expect(runRetentionEpoch(invalid)).rejects.toThrow("checkpoint factory changed coordinator-owned fields");
     expect(await store.listCheckpoints({ tenantId: TENANT_ID })).toEqual([]);

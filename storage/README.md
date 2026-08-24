@@ -100,12 +100,54 @@ journal/snapshot transaction before it can be capable.
 `createRetentionStagingArchive` is a separate, short-lived derived safety copy
 for one explicit epoch. It intentionally does not widen `ObjectAuditArchive`.
 `runRetentionEpoch` executes `seal → verify → compact → prepare → delete →
-confirm`: it requires a host-injected durable per-tenant epoch lease and two
+confirm absence → resolve disposal time → confirm receipt`: it requires a
+host-injected durable per-tenant epoch lease, a trusted asynchronous
+`resolveDisposedAt(context)` callback, and two
 host-injected policy-fence callbacks. The first fence guards the crop; the
 second remains held through provider deletion, direct-read plus prefix-list
 absence confirmation, and receipt confirmation. The helpers read no
 environment, credentials, clock, or legal-hold state; hosts supply those
 boundaries and must re-evaluate eligibility/version on every retry.
+
+`resolveDisposedAt` is invoked exactly once for a new receipt, after deletion
+and both absence checks succeed and immediately before receipt creation. Its
+only context fields are `tenantId`, a detached checkpoint clone, `attemptId`,
+`dispositionId`, and `policyFence`. It must return an exact UTC-millisecond
+instant such as `2026-08-25T00:00:00.000Z`; rejection or malformed output fails
+closed without persisting a receipt. Delete and absence failures never invoke
+it. A cold replay with an already accepted disposition verifies and returns the
+stored receipt byte-for-byte without invoking the callback.
+
+Hosts can gate the installed public package identities and retention behavior
+without reading package files or environment variables:
+
+```ts
+import { VERITIO_CORE_VERSION } from "@veritio/core/version";
+import {
+  RETENTION_COORDINATOR_CAPABILITY,
+  type RetentionDisposedAtResolver,
+} from "@veritio/storage/retention";
+import { VERITIO_STORAGE_VERSION } from "@veritio/storage/version";
+
+if (
+  VERITIO_CORE_VERSION !== "0.4.8" ||
+  VERITIO_STORAGE_VERSION !== "0.4.8" ||
+  !RETENTION_COORDINATOR_CAPABILITY.resolvesDisposedAtAfterConfirmedAbsence ||
+  !RETENTION_COORDINATOR_CAPABILITY.replaysAcceptedDispositionWithoutResolvingDisposedAt
+) {
+  throw new Error("unsupported Veritio retention coordinator");
+}
+
+const resolveDisposedAt: RetentionDisposedAtResolver = async (
+  { tenantId, checkpoint, attemptId, dispositionId, policyFence },
+) => trustedHostClock.confirmedProviderAbsenceTime({
+  tenantId,
+  checkpointHash: checkpoint.hash,
+  attemptId,
+  dispositionId,
+  policyFence,
+});
+```
 
 Cold retries inspect authoritative checkpoints and accepted dispositions before
 deriving anything from audit records. When a stored checkpoint has no receipt,

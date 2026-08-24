@@ -1658,3 +1658,4 @@ export type {
 export { verifyAuditChainScoped, verifyEdgeChainScoped } from "./export-bundle-chain-modes.js";
 export type { ExportBundleChainScope } from "./export-bundle-chain-modes.js";
 export * from "./retention.js";
+export * from "./version.js";
