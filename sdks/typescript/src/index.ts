@@ -13,6 +13,8 @@ export const HASH_ALGORITHM = "sha256";
 export const EVIDENCE_COMMIT_TREE_ALGORITHM = "veritio-merkle-v1";
 const ACTION_PATTERN = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const RETENTION_ATTEMPT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const RETENTION_ATTEMPT_KEYS = new Set(["attemptId", "checkpointHash", "policyFence", "status"]);
 
 export const EVIDENCE_ENTITY_TYPES = [
   "tenant",
@@ -1008,12 +1010,12 @@ export class MemoryAuditStore implements CheckpointingAuditStore {
     if (current.retentionPolicyFence !== expectedPolicyFence) {
       throw new TypeError("retention policy fence mismatch");
     }
+    const checkpointHash = receipt.checkpointHash;
     const attempts = this.#tenantDispositionAttempts.get(scope.tenantId);
-    const attemptEntry = [...(attempts?.entries() ?? [])].find(([, attempt]) => attempt.attemptId === expectedAttemptId);
-    if (!attemptEntry) {
+    const attempt = attempts?.get(checkpointHash);
+    if (!attempt || attempt.attemptId !== expectedAttemptId) {
       throw new TypeError("disposition attempt mismatch");
     }
-    const [checkpointHash, attempt] = attemptEntry;
     if (attempt.policyFence !== expectedPolicyFence || attempt.checkpointHash !== checkpointHash) {
       throw new TypeError("disposition attempt fence mismatch");
     }
@@ -1040,7 +1042,12 @@ export class MemoryAuditStore implements CheckpointingAuditStore {
     }
 
     dispositions.set(checkpointHash, cloneRetentionDisposition(receipt));
-    attempts?.set(checkpointHash, { ...attempt, status: "disposed" });
+    attempts?.set(checkpointHash, {
+      attemptId: attempt.attemptId,
+      checkpointHash: attempt.checkpointHash,
+      policyFence: attempt.policyFence,
+      status: "disposed",
+    });
     this.#tenantDispositions.set(scope.tenantId, dispositions);
   }
 
@@ -1504,7 +1511,12 @@ function cloneRetentionCheckpoint(checkpoint: RetentionCheckpoint): RetentionChe
  * disposed compare-and-swap binding after preparation.
  */
 function cloneDispositionAttempt(attempt: DispositionAttempt): DispositionAttempt {
-  return { ...attempt };
+  return {
+    attemptId: attempt.attemptId,
+    checkpointHash: attempt.checkpointHash,
+    policyFence: attempt.policyFence,
+    status: attempt.status,
+  };
 }
 
 /**
@@ -1568,7 +1580,16 @@ function assertDispositionAttempt(attempt: DispositionAttempt): void {
   if (typeof attempt !== "object" || attempt === null) {
     throw new TypeError("invalid disposition attempt");
   }
-  assertNonEmpty(attempt.attemptId, "attempt.attemptId");
+  const keys = Reflect.ownKeys(attempt).filter((key) => Object.prototype.propertyIsEnumerable.call(attempt, key));
+  if (
+    keys.length !== RETENTION_ATTEMPT_KEYS.size ||
+    keys.some((key) => typeof key !== "string" || !RETENTION_ATTEMPT_KEYS.has(key))
+  ) {
+    throw new TypeError("invalid disposition attempt fields");
+  }
+  if (typeof attempt.attemptId !== "string" || !RETENTION_ATTEMPT_ID_PATTERN.test(attempt.attemptId)) {
+    throw new TypeError("attempt.attemptId is invalid");
+  }
   if (!/^[a-f0-9]{64}$/.test(attempt.checkpointHash)) {
     throw new TypeError("attempt.checkpointHash must be lowercase sha256");
   }

@@ -192,6 +192,58 @@ describe("MemoryAuditStore retention checkpoints", () => {
 });
 
 describe("MemoryAuditStore retention disposition", () => {
+  test("rejects unknown enumerable attempt fields before they can enter durable state", async () => {
+    const store = new MemoryAuditStore();
+    const checkpoint = await compactFixture(store);
+    const attemptWithSecret = {
+      attemptId: "attempt_minimal",
+      checkpointHash: checkpoint.hash,
+      policyFence: 0,
+      status: "pending",
+      authorization: "Bearer must-not-persist",
+    } as const;
+
+    await expect(store.prepareDisposition(SCOPE, checkpoint.hash, attemptWithSecret, 0)).rejects.toThrow();
+
+    const minimalAttempt: DispositionAttempt = {
+      attemptId: "attempt_minimal",
+      checkpointHash: checkpoint.hash,
+      policyFence: 0,
+      status: "pending",
+    };
+    expect(await store.prepareDisposition(SCOPE, checkpoint.hash, minimalAttempt, 0)).toEqual(minimalAttempt);
+  });
+
+  test("rejects unknown enumerable symbol fields from disposition attempts", async () => {
+    const store = new MemoryAuditStore();
+    const checkpoint = await compactFixture(store);
+    const secretField = Symbol("provider-secret");
+    const attempt = {
+      attemptId: "attempt_symbol",
+      checkpointHash: checkpoint.hash,
+      policyFence: 0,
+      status: "pending",
+      [secretField]: "must-not-persist",
+    } as const;
+
+    await expect(store.prepareDisposition(SCOPE, checkpoint.hash, attempt, 0)).rejects.toThrow();
+  });
+
+  test("rejects malformed, personal, or overlong attempt identifiers", async () => {
+    const store = new MemoryAuditStore();
+    const checkpoint = await compactFixture(store);
+
+    for (const attemptId of ["operator@example.com", "a".repeat(129), 123 as unknown as string]) {
+      const attempt: DispositionAttempt = {
+        attemptId,
+        checkpointHash: checkpoint.hash,
+        policyFence: 0,
+        status: "pending",
+      };
+      await expect(store.prepareDisposition(SCOPE, checkpoint.hash, attempt, 0)).rejects.toThrow();
+    }
+  });
+
   test("replays one exact pending attempt and one exact disposed receipt idempotently", async () => {
     const store = new MemoryAuditStore();
     const checkpoint = await compactFixture(store);
@@ -312,5 +364,45 @@ describe("MemoryAuditStore retention disposition", () => {
 
     await expect(store.confirmDisposition(SCOPE, mismatchedReceipt, attempt.attemptId, 0)).rejects.toThrow();
     expect(await store.listDispositions(SCOPE)).toEqual([]);
+  });
+
+  test("resolves confirmation by receipt checkpoint before CASing a duplicate attempt id", async () => {
+    const store = new MemoryAuditStore();
+    const first = await store.append(auditEvent("evt_1", 1));
+    const second = await store.append(auditEvent("evt_2", 2));
+    const firstCheckpoint = checkpointFor([first]);
+    const initialState = await store.getChainState(SCOPE);
+    await store.compactRange(SCOPE, firstCheckpoint, initialState, initialState.retentionPolicyFence);
+    const secondCheckpoint = checkpointFor([second], { epoch: 2, previousCheckpoint: firstCheckpoint });
+    const secondState = await store.getChainState(SCOPE);
+    await store.compactRange(SCOPE, secondCheckpoint, secondState, secondState.retentionPolicyFence);
+
+    const duplicateAttemptId = "attempt_shared";
+    await store.prepareDisposition(
+      SCOPE,
+      firstCheckpoint.hash,
+      { attemptId: duplicateAttemptId, checkpointHash: firstCheckpoint.hash, policyFence: 0, status: "pending" },
+      0,
+    );
+    await store.prepareDisposition(
+      SCOPE,
+      secondCheckpoint.hash,
+      { attemptId: duplicateAttemptId, checkpointHash: secondCheckpoint.hash, policyFence: 0, status: "pending" },
+      0,
+    );
+    const secondReceipt = createRetentionDisposition({
+      dispositionId: "disposition_second",
+      tenantId: TENANT_ID,
+      chainKind: "audit",
+      checkpointHash: secondCheckpoint.hash,
+      fromSequence: secondCheckpoint.fromSequence,
+      throughSequence: secondCheckpoint.throughSequence,
+      archiveRootHash: secondCheckpoint.archiveRootHash,
+      policyReference: "policy.v1",
+      disposedAt: "2026-08-24T05:00:00.000Z",
+    });
+
+    await store.confirmDisposition(SCOPE, secondReceipt, duplicateAttemptId, 0);
+    expect(await store.listDispositions(SCOPE)).toEqual([secondReceipt]);
   });
 });
