@@ -239,8 +239,9 @@ export function parseVerifyBundleArgs(args: readonly string[]): VerifyBundleOpti
 
 /**
  * Runs `veritio verify-bundle`: reads the container file, parses it, runs the
- * fail-closed offline verifier, and prints either a human summary or the raw
- * `--json` report. Exit code is 0 iff the report is valid. Every failure path —
+ * fail-closed version-dispatched offline verifier, and prints either a human
+ * summary or the `--json` report. V2 summaries expose only chain verdicts, not
+ * raw event bodies. Exit code is 0 iff the report is valid. Every failure path —
  * unreadable file, malformed container, or bad key file — prints a sanitized
  * message to stderr and returns 1; stack traces and raw error text never reach
  * the user.
@@ -279,8 +280,10 @@ export async function runVerifyBundle(
   }
 
   let report: Awaited<ReturnType<typeof verifyExportBundle>>;
+  let bundleVersion: "vevb-1" | "vevb-2";
   try {
     const bundle = parseExportBundle(text);
+    bundleVersion = bundle.bundleVersion;
     report = await verifyExportBundle(bundle, {
       requireSignature: options.requireSignature,
       ...(publicKey ? { publicKey } : {}),
@@ -291,11 +294,22 @@ export async function runVerifyBundle(
   }
 
   if (options.json) {
-    write(JSON.stringify(report, null, 2));
+    write(JSON.stringify(bundleVersion === "vevb-2" ? { bundleVersion, ...report } : report, null, 2));
   } else {
-    write(`structure: ${report.checks.structure ? "pass" : "fail"}`);
-    write(`integrity: ${report.checks.integrity ? "pass" : "fail"}`);
-    write(`chains: ${report.checks.chains ? "pass" : "fail"}`);
+    if (bundleVersion === "vevb-2" && "checkpoints" in report.checks) {
+      write("version: vevb-2");
+      write(`structure: ${report.checks.structure ? "pass" : "fail"}`);
+      write(`integrity: ${report.checks.integrity ? "pass" : "fail"}`);
+      write(`checkpoints: ${report.checks.checkpoints ? "pass" : "fail"}`);
+      write(`dispositions: ${report.checks.dispositions ? "pass" : "fail"}`);
+      write(`audit: ${report.checks.audit ? "pass" : "fail"}`);
+      write(`edges: ${report.checks.edges ? "pass" : "fail"}`);
+      write(`commits: ${report.checks.commits ? "pass" : "fail"}`);
+    } else {
+      write(`structure: ${report.checks.structure ? "pass" : "fail"}`);
+      write(`integrity: ${report.checks.integrity ? "pass" : "fail"}`);
+      write(`chains: ${"chains" in report.checks && report.checks.chains ? "pass" : "fail"}`);
+    }
     write(`signature: ${report.checks.signature}`);
     if (report.issues.length > 0) {
       write("issues:");

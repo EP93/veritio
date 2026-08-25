@@ -1,0 +1,101 @@
+{
+  "name": "export-bundle-tampered-v2",
+  "description": "The complete v2 golden container with the latest checkpoint throughHash changed without updating that checkpoint hash, the file digest, or rootHash.",
+  "bundleVersion": "vevb-2",
+  "tamper": "records/retention-checkpoints.jsonl latest throughHash first nibble changed from 6 to 7",
+  "expected": {
+    "valid": false,
+    "integrity": false,
+    "checkpoints": false
+  },
+  "bundle": {
+    "bundleVersion": "vevb-2",
+    "manifest": {
+      "bundleVersion": "vevb-2",
+      "createdAt": "2026-08-24T00:12:02.000Z",
+      "scope": {
+        "tenantId": "org_fixture",
+        "workspaceId": "wks_export_fixture",
+        "environment": "test"
+      },
+      "range": {
+        "from": "2026-08-24T00:12:00.000Z",
+        "to": "2026-08-24T00:12:00.000Z"
+      },
+      "producer": {
+        "authority": "veritio",
+        "kind": "principal",
+        "type": "service",
+        "id": "svc_export_fixture"
+      },
+      "chainClaims": {
+        "audit": {
+          "origin": {
+            "kind": "checkpoint",
+            "checkpointHash": "8b0dd0ae682ad15f4a13790593fbca38ad375105f3df76865e18b8f1130863d2"
+          },
+          "completeness": "complete-retained-tail"
+        },
+        "evidenceEdges": {
+          "origin": {
+            "kind": "genesis"
+          },
+          "completeness": "full"
+        },
+        "evidenceCommits": {
+          "origin": {
+            "kind": "genesis"
+          },
+          "completeness": "empty"
+        }
+      },
+      "files": [
+        {
+          "path": "records/audit-events.jsonl",
+          "sha256": "f057bf4869dbbca5a218e69f99f601d49644e264686b60c5b60675d19961ccbf",
+          "records": 1,
+          "bytes": 641
+        },
+        {
+          "path": "records/evidence-edges.jsonl",
+          "sha256": "0255266cd0f451f8782050f43a753aad20be3b195059560706bc6e0a47b49ba3",
+          "records": 1,
+          "bytes": 676
+        },
+        {
+          "path": "records/commits.jsonl",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "records": 0,
+          "bytes": 0
+        },
+        {
+          "path": "records/retention-checkpoints.jsonl",
+          "sha256": "71a4581c63cd1ccae2ad645aeeb98a2015339a0d6fe95ac0cdb38cbaa7ab01f9",
+          "records": 2,
+          "bytes": 1307
+        },
+        {
+          "path": "records/retention-dispositions.jsonl",
+          "sha256": "421eeb7453f30007ee74c328d62074b5adfe5f2b2a4f5e9334c87ea6b8460eb9",
+          "records": 2,
+          "bytes": 1176
+        },
+        {
+          "path": "verification.json",
+          "sha256": "8ea1330aa9b90b1d601cc953f86e2612844dba043f5da3f8af83b218bc470654",
+          "records": 0,
+          "bytes": 173
+        }
+      ],
+      "rootHash": "186b5dd96e28e49bd8442861f1220d5aa3d601091590db76e0f829a6b67d48a2"
+    },
+    "files": {
+      "records/audit-events.jsonl": "{\"appendedAt\":\"2026-08-24T00:12:01.000Z\",\"canonicalization\":\"veritio-json-v1\",\"event\":{\"action\":\"retention.tail.retained\",\"actor\":{\"id\":\"retention_fixture\",\"type\":\"system\"},\"id\":\"evt_retained_004\",\"metadata\":{},\"occurredAt\":\"2026-08-24T00:12:00.000Z\",\"schemaVersion\":\"2026-06-10\",\"scope\":{\"tenantId\":\"org_fixture\"},\"target\":{\"id\":\"rec_004\",\"type\":\"record\"}},\"hash\":\"3520aacc1d5fd10c1837e72a6f811015044a1c61ea20b8f19de32c6e729e858d\",\"hashAlgorithm\":\"sha256\",\"idempotencyKeyHash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"previousHash\":\"6417b8916ca4224a860e9b7ba9870e6ab34c30772f029775ff1fb9af88b11f3a\",\"sequence\":4}\n",
+      "records/evidence-edges.jsonl": "{\"appendedAt\":\"2026-07-05T00:00:00.000Z\",\"canonicalization\":\"veritio-json-v1\",\"edge\":{\"from\":{\"id\":\"agt_sess_fixture_01\",\"type\":\"agent_session\"},\"id\":\"edge_export_v2_001\",\"metadata\":{},\"occurredAt\":\"2026-07-01T09:00:01.000Z\",\"relation\":\"created\",\"schemaVersion\":\"2026-06-13\",\"scope\":{\"environment\":\"test\",\"tenantId\":\"org_fixture\",\"workspaceId\":\"wks_export_fixture\"},\"to\":{\"id\":\"file_fixture_readme\",\"pathHash\":\"sha256:path_fixture_readme\",\"type\":\"file\"}},\"hash\":\"5eb42da81568570d48944e7b98020053cd3bccfe441de5cbbc1123cffe9ca650\",\"hashAlgorithm\":\"sha256\",\"idempotencyKeyHash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"previousHash\":null,\"sequence\":1}\n",
+      "records/commits.jsonl": "",
+      "records/retention-checkpoints.jsonl": "{\"archiveRootHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"canonicalization\":\"veritio-json-v1\",\"chainKind\":\"audit\",\"checkpointId\":\"rcp_001\",\"createdAt\":\"2026-08-24T00:00:00.000Z\",\"epoch\":1,\"fromPreviousHash\":null,\"fromSequence\":1,\"hash\":\"673dc45f77a9358388150de8c8525794dd9e72e5bd4e02fc648cb62e6df91dfb\",\"hashAlgorithm\":\"sha256\",\"previousCheckpointHash\":null,\"recordCount\":2,\"recordType\":\"retention.checkpoint\",\"schemaVersion\":\"1.0\",\"tenantId\":\"org_fixture\",\"throughHash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"throughSequence\":2}\n{\"archiveRootHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"canonicalization\":\"veritio-json-v1\",\"chainKind\":\"audit\",\"checkpointId\":\"rcp_002_export\",\"createdAt\":\"2026-08-24T00:01:00.000Z\",\"epoch\":2,\"fromPreviousHash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"fromSequence\":3,\"hash\":\"8b0dd0ae682ad15f4a13790593fbca38ad375105f3df76865e18b8f1130863d2\",\"hashAlgorithm\":\"sha256\",\"previousCheckpointHash\":\"673dc45f77a9358388150de8c8525794dd9e72e5bd4e02fc648cb62e6df91dfb\",\"recordCount\":1,\"recordType\":\"retention.checkpoint\",\"schemaVersion\":\"1.0\",\"tenantId\":\"org_fixture\",\"throughHash\":\"7417b8916ca4224a860e9b7ba9870e6ab34c30772f029775ff1fb9af88b11f3a\",\"throughSequence\":3}\n",
+      "records/retention-dispositions.jsonl": "{\"archiveRootHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"canonicalization\":\"veritio-json-v1\",\"chainKind\":\"audit\",\"checkpointHash\":\"673dc45f77a9358388150de8c8525794dd9e72e5bd4e02fc648cb62e6df91dfb\",\"disposedAt\":\"2026-08-24T00:10:00.000Z\",\"dispositionId\":\"rdp_001_export\",\"fromSequence\":1,\"hash\":\"ef9260f28139670e45ff9238cb2dd28b762869117f53025cca3c55217eb61c12\",\"hashAlgorithm\":\"sha256\",\"method\":\"provider-delete\",\"policyReference\":\"policy:retention.v1\",\"recordType\":\"retention.disposition\",\"schemaVersion\":\"1.0\",\"tenantId\":\"org_fixture\",\"throughSequence\":2}\n{\"archiveRootHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"canonicalization\":\"veritio-json-v1\",\"chainKind\":\"audit\",\"checkpointHash\":\"8b0dd0ae682ad15f4a13790593fbca38ad375105f3df76865e18b8f1130863d2\",\"disposedAt\":\"2026-08-24T00:11:00.000Z\",\"dispositionId\":\"rdp_002_export\",\"fromSequence\":3,\"hash\":\"f2fa260f3f793869c8cc9665ca73bc63fe446c39a4adf7272445e5380786326e\",\"hashAlgorithm\":\"sha256\",\"method\":\"provider-delete\",\"policyReference\":\"policy:retention.v1\",\"recordType\":\"retention.disposition\",\"schemaVersion\":\"1.0\",\"tenantId\":\"org_fixture\",\"throughSequence\":3}\n",
+      "verification.json": "{\"audit\":{\"valid\":true},\"checkpoints\":{\"signature\":\"absent\",\"valid\":true},\"commits\":{\"valid\":true},\"dispositions\":{\"signature\":\"absent\",\"valid\":true},\"edges\":{\"valid\":true}}"
+    }
+  }
+}

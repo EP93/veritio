@@ -12,6 +12,14 @@
 
 import { canonicalJson, sha256Hex, verifyCommitChain } from "./export-bundle-deps.js";
 import { verifyAuditChainScoped, verifyEdgeChainScoped } from "./export-bundle-chain-modes.js";
+import {
+  isExportBundleV2Container,
+  verifyExportBundleV2,
+  type ExportBundleV2,
+  type ExportBundleV2Manifest,
+  type ExportBundleV2VerificationReport,
+} from "./export-bundle-v2.js";
+import type { RetentionVerificationOptions } from "./retention.js";
 
 /**
  * One record file inside an export bundle. `path` is the bundle-relative file
@@ -143,12 +151,15 @@ export interface ExportBundleInput {
  * so a consumer can persist the bundle or recompute its hashes directly.
  * `signature` is present only once a bundle has been signed by a later task.
  */
-export interface ExportBundle {
+export interface ExportBundleV1 {
   bundleVersion: "vevb-1";
   manifest: ExportBundleManifest;
   files: Record<string, string>;
   signature?: ExportBundleSignature;
 }
+
+/** Discriminates the byte-stable legacy format from checkpoint-aware vevb-2. */
+export type ExportBundle = ExportBundleV1 | ExportBundleV2;
 
 /**
  * Serializes a record array into a `.jsonl` payload. Each record is emitted as
@@ -178,7 +189,7 @@ function serializeRecords(records: unknown[]): string {
  * `rootHash`, and summarized in `manifest.annex` as `{ packId, version }`. The
  * returned bundle is unsigned.
  */
-export async function buildExportBundle(input: ExportBundleInput): Promise<ExportBundle> {
+export async function buildExportBundle(input: ExportBundleInput): Promise<ExportBundleV1> {
   const commits = input.commits ?? [];
   const chainScope = input.chainScope ?? "full";
 
@@ -321,7 +332,9 @@ function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
  * signing invalidates the signature. The signer and verifier MUST derive the
  * payload identically for a signature to check out.
  */
-async function signedManifestPayload(manifest: ExportBundleManifest): Promise<Uint8Array<ArrayBuffer>> {
+async function signedManifestPayload(
+  manifest: ExportBundleManifest | ExportBundleV2Manifest,
+): Promise<Uint8Array<ArrayBuffer>> {
   // Copy through Uint8Array.from so the payload is backed by a plain ArrayBuffer,
   // which WebCrypto's sign/verify BufferSource parameter requires (TextEncoder's
   // output is typed over the wider ArrayBufferLike).
@@ -341,13 +354,13 @@ async function signedManifestPayload(manifest: ExportBundleManifest): Promise<Ui
  * and key always produce byte-identical output. The returned bundle verifies with
  * {@link verifyExportBundle} when given the matching `publicKey`.
  */
-export async function signExportBundle(
-  bundle: ExportBundle,
+export async function signExportBundle<T extends ExportBundle>(
+  bundle: T,
   privateKey: CryptoKey,
   publicKey: CryptoKey,
-): Promise<ExportBundle> {
+): Promise<T> {
   const fingerprint = await publicKeyFingerprint(publicKey);
-  const manifest: ExportBundleManifest = { ...bundle.manifest, signaturePublicKeyFingerprint: fingerprint };
+  const manifest = { ...bundle.manifest, signaturePublicKeyFingerprint: fingerprint } as T["manifest"];
   const payload = await signedManifestPayload(manifest);
   const signatureBytes = await crypto.subtle.sign("Ed25519", privateKey, payload);
   return {
@@ -358,7 +371,7 @@ export async function signExportBundle(
       publicKeyFingerprint: fingerprint,
       signature: bytesToBase64(new Uint8Array(signatureBytes)),
     },
-  };
+  } as T;
 }
 
 /**
@@ -379,7 +392,7 @@ export function serializeExportBundle(bundle: ExportBundle): string {
  * not deep schema or integrity validation (the verifier owns that). It rejects,
  * with a sanitized `Error`, text that is not valid JSON or not a JSON object
  * (`'export bundle: invalid JSON container'`, never leaking the raw parser
- * message), any `bundleVersion` other than `'vevb-1'`
+ * message), any `bundleVersion` other than `'vevb-1'` or `'vevb-2'`
  * (`'export bundle: unsupported bundleVersion …'`), and a container whose
  * `manifest` or `files` is missing or not an object
  * (`'export bundle: missing manifest or files'`).
@@ -398,8 +411,12 @@ export function parseExportBundle(text: string): ExportBundle {
 
   const container = parsed as Record<string, unknown>;
 
-  if (container.bundleVersion !== "vevb-1") {
+  if (container.bundleVersion !== "vevb-1" && container.bundleVersion !== "vevb-2") {
     throw new Error(`export bundle: unsupported bundleVersion ${JSON.stringify(container.bundleVersion)}`);
+  }
+
+  if (container.bundleVersion === "vevb-2" && !isExportBundleV2Container(container)) {
+    throw new Error("export bundle: invalid vevb-2 container");
   }
 
   if (
@@ -481,7 +498,7 @@ function splitRecordLines(payload: string): string[] {
  * caught and reported as `'invalid'` with a static message, never raw error text.
  */
 async function verifyBundleSignature(
-  bundle: ExportBundle,
+  bundle: ExportBundleV1,
   publicKey: CryptoKey,
 ): Promise<{ signature: "valid" | "invalid"; issue?: string }> {
   const sig = bundle.signature as ExportBundleSignature;
@@ -530,17 +547,52 @@ async function verifyBundleSignature(
  * strings and drive `valid` to false. The function throws only for programmer
  * misuse: a `bundle` that is not an object.
  */
+export interface ExportBundleVerificationOptions {
+  publicKey?: CryptoKey;
+  requireSignature?: boolean;
+  /** Injected retention signature policy; core never reads keys from environment state. */
+  retention?: RetentionVerificationOptions;
+}
+
+/** Dispatches verification only from the explicit container discriminator. */
+export function verifyExportBundle(
+  bundle: ExportBundleV1,
+  opts?: ExportBundleVerificationOptions,
+): Promise<ExportBundleVerificationReport>;
+export function verifyExportBundle(
+  bundle: ExportBundleV2,
+  opts?: ExportBundleVerificationOptions,
+): Promise<ExportBundleV2VerificationReport>;
+export function verifyExportBundle(
+  bundle: ExportBundle,
+  opts?: ExportBundleVerificationOptions,
+): Promise<ExportBundleVerificationReport | ExportBundleV2VerificationReport>;
 export async function verifyExportBundle(
   bundle: ExportBundle,
-  opts?: { publicKey?: CryptoKey; requireSignature?: boolean },
+  opts: ExportBundleVerificationOptions = {},
+): Promise<ExportBundleVerificationReport | ExportBundleV2VerificationReport> {
+  if (!isPlainObject(bundle)) {
+    throw new TypeError("verifyExportBundle: expected an ExportBundle object");
+  }
+  if (bundle.bundleVersion === "vevb-2") return verifyExportBundleV2(bundle, opts);
+  if (bundle.bundleVersion === "vevb-1") return verifyExportBundleV1(bundle, opts);
+  throw new TypeError(
+    `verifyExportBundle: unsupported bundleVersion ${JSON.stringify((bundle as Record<string, unknown>).bundleVersion)}`,
+  );
+}
+
+/** Preserves the original vevb-1 verification path byte-for-byte. */
+async function verifyExportBundleV1(
+  bundle: ExportBundleV1,
+  opts: ExportBundleVerificationOptions = {},
 ): Promise<ExportBundleVerificationReport> {
   if (!isPlainObject(bundle)) {
     throw new TypeError("verifyExportBundle: expected an ExportBundle object");
   }
 
   const issues: string[] = [];
-  const manifest = (bundle as ExportBundle).manifest;
-  const files = (bundle as ExportBundle).files;
+  const manifest = bundle.manifest;
+  const files = bundle.files;
 
   // Signature: `signatureSatisfied` is the single gate the overall verdict reads.
   // A present signature is verified only when the caller supplies `publicKey`
@@ -548,10 +600,10 @@ export async function verifyExportBundle(
   // caller opted out); absent is 'absent' and satisfied unless `requireSignature`.
   let signature: ExportBundleVerificationReport["checks"]["signature"];
   let signatureSatisfied = true;
-  const hasSignature = isPlainObject((bundle as ExportBundle).signature);
+  const hasSignature = isPlainObject(bundle.signature);
   if (hasSignature) {
     if (opts?.publicKey) {
-      const verdict = await verifyBundleSignature(bundle as ExportBundle, opts.publicKey);
+      const verdict = await verifyBundleSignature(bundle, opts.publicKey);
       signature = verdict.signature;
       if (verdict.issue) issues.push(verdict.issue);
       signatureSatisfied = signature === "valid";

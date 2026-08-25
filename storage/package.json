@@ -1,6 +1,6 @@
 {
   "name": "@veritio/storage",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Host-injected storage adapters for Veritio audit trail evidence.",
   "homepage": "https://getveritio.com",
   "license": "Apache-2.0",
@@ -29,6 +29,16 @@
       "types": "./dist/conformance.d.ts",
       "import": "./dist/conformance.js",
       "default": "./dist/conformance.js"
+    },
+    "./retention": {
+      "types": "./dist/retention.d.ts",
+      "import": "./dist/retention.js",
+      "default": "./dist/retention.js"
+    },
+    "./version": {
+      "types": "./dist/version.d.ts",
+      "import": "./dist/version.js",
+      "default": "./dist/version.js"
     }
   },
   "files": [

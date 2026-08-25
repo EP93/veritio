@@ -44,6 +44,65 @@ portable filters for internal/external/partner/system logs and
 api/app/worker/cli/webhook surfaces. They only use metadata keys
 (`logVisibility`, `logSurface`); they are not protocol fields.
 
+## Audit Retention Checkpoints
+
+Python exposes the same audit-only checkpoint and disposition records as the
+TypeScript and Go SDKs. Callers provide ids and UTC-millisecond timestamps; the
+helpers do not read a clock, environment, provider, or legal-hold state.
+`verify_audit_records_from_checkpoint` is deliberately separate from the
+existing genesis-only audit verifier.
+
+```python
+from veritio import (
+    create_retention_checkpoint,
+    create_retention_disposition,
+    verify_audit_records_from_checkpoint,
+    verify_retention_checkpoint_chain,
+    verify_retention_disposition,
+)
+
+# The caller supplies the current hot tail from its authoritative store.
+retained_audit_records: list[dict] = []
+
+checkpoint = create_retention_checkpoint({
+    "checkpointId": "rcp_org_123_1",
+    "tenantId": "org_123",
+    "chainKind": "audit",
+    "epoch": 1,
+    "fromSequence": 1,
+    "fromPreviousHash": None,
+    "throughSequence": 1000,
+    "throughHash": "a" * 64,
+    "recordCount": 1000,
+    "archiveRootHash": "b" * 64,
+    "previousCheckpointHash": None,
+    "createdAt": "2026-08-24T00:00:00.000Z",
+})
+verify_retention_checkpoint_chain([checkpoint])
+verify_audit_records_from_checkpoint(checkpoint, retained_audit_records)
+
+receipt = create_retention_disposition({
+    "dispositionId": "rdp_org_123_1",
+    "tenantId": "org_123",
+    "chainKind": "audit",
+    "checkpointHash": checkpoint["hash"],
+    "fromSequence": checkpoint["fromSequence"],
+    "throughSequence": checkpoint["throughSequence"],
+    "archiveRootHash": checkpoint["archiveRootHash"],
+    "policyReference": "retention-policy-v1",
+    "disposedAt": "2026-08-24T00:05:00.000Z",
+})
+verify_retention_disposition(receipt, checkpoint)
+```
+
+Callers may inject a signature verifier and trusted public key; a requested
+signature fails closed when unavailable. The checkpoint/receipt are an audit
+trail of a verified anchor and provider-delete attempt, not proof that every
+replica or backup is erased. Disposed epoch bodies cannot be replayed. In v1,
+evidence-edge and `EvidenceCommit` retention remain non-capable, while
+checkpoint-aware export behavior is `vevb-2` with a complete checkpoint chain
+and retained audit tail; existing `vevb-1` remains immutable and default.
+
 ## Governed Action Drafts
 
 Use `define_entity` + `create_governed_action_draft` inside FastAPI routes,

@@ -22,6 +22,154 @@ Host applications must provide a transaction-capable client wrapper. The store
 uses tenant-scoped append ordering, idempotency-key hashes, expected previous
 hash checks, and persisted record integrity validation.
 
+## Audit Retention Checkpoints
+
+Retention checkpointing is an **audit-chain-only** capability in v1. The
+Postgres/Neon, MySQL/MariaDB, and Mongo factories return a
+`CheckpointingAuditStore`; it preserves the authoritative tenant tip separately
+from hot rows, atomically records a checkpoint and crops its exact covered
+prefix, and preserves the minimum idempotency ledger needed to reject a
+post-crop duplicate. `MemoryAuditStore` in `@veritio/core` implements the same
+contract for tests, not as production durability.
+
+`AuditChainState` is relational, not merely a set of typed columns. The tip
+sequence is zero exactly when its hash is null; a positive tip requires a valid
+hash. `minimumRetainedSequence` is in `1..authoritativeTipSequence + 1` and is
+one exactly when `latestCheckpointHash` is null; a later minimum requires a
+valid latest-checkpoint hash. `@veritio/core`'s `assertAuditChainState`
+validates host expected state, and every capable adapter applies the same
+validator to persisted state before append or crop mutation.
+
+Before activating retention on an existing authoritative database, apply the
+additive schema constant (`POSTGRES_AUDIT_RECORDS_SCHEMA_SQL` or
+`MYSQL_AUDIT_RECORDS_SCHEMA_SQL`) before any checkpoint/crop call. Its SQL
+backfill selects the highest legacy sequence/hash for each tenant; it does not
+replay or validate the historical chain. Before treating that seeded state as
+authoritative, the host must integrity-replay every legacy tenant with
+`verifyAuditRecords` and investigate any failure. Then run retention
+conformance against a real database before scheduling a worker.
+
+For Mongo, provision the collections passed through `retention`, create
+`MONGO_RETENTION_INDEXES` as well as `MONGO_AUDIT_RECORD_INDEXES`, and use a
+replica-set transaction boundary. Run `backfillMongoAuditRetentionState` for
+each legacy tenant: it verifies the complete hot chain and atomically writes
+that tenant's chain state and minimal idempotency ledger. Do not enable crops
+until every tenant backfill and real-DB conformance have succeeded.
+
+```ts
+import {
+  MONGO_AUDIT_RECORD_INDEXES,
+  MONGO_RETENTION_INDEXES,
+  POSTGRES_AUDIT_RECORDS_SCHEMA_SQL,
+  backfillMongoAuditRetentionState,
+  createPostgresAuditStore,
+} from "@veritio/storage";
+import { createRetentionStoreConformanceTests } from "@veritio/storage/conformance";
+
+// Each returned conformance case must receive an empty, isolated real database
+// target. `host.createIsolatedPostgresTarget` is application test-harness code.
+for (const conformanceTest of createRetentionStoreConformanceTests({
+  name: "postgres retention",
+  createTarget: async () => {
+    const target = await host.createIsolatedPostgresTarget();
+    await target.executor.execute(POSTGRES_AUDIT_RECORDS_SCHEMA_SQL, []);
+    return {
+      store: createPostgresAuditStore({ client: target.executor }),
+      close: () => target.close(),
+    };
+  },
+})) {
+  test(conformanceTest.name, conformanceTest.run);
+}
+
+await host.createIndexes(MONGO_AUDIT_RECORD_INDEXES);
+await host.createRetentionIndexes(MONGO_RETENTION_INDEXES);
+for (const tenantId of legacyTenantIds) {
+  await backfillMongoAuditRetentionState(mongoOptions, { tenantId });
+}
+```
+
+Only audit records are capable in v1. Evidence-edge chains and
+`EvidenceCommit` remain genesis/full-chain records; `FileEvidenceStore`, the
+ClickHouse read model, and `ObjectAuditArchive` do not implement
+`CheckpointingAuditStore`. A future file adapter needs a crash-safe
+journal/snapshot transaction before it can be capable.
+
+### Derived staging and disposal
+
+`createRetentionStagingArchive` is a separate, short-lived derived safety copy
+for one explicit epoch. It intentionally does not widen `ObjectAuditArchive`.
+`runRetentionEpoch` executes `seal → verify → compact → prepare → delete →
+confirm absence → resolve disposal time → confirm receipt`: it requires a
+host-injected durable per-tenant epoch lease, a trusted asynchronous
+`resolveDisposedAt(context)` callback, and two
+host-injected policy-fence callbacks. The first fence guards the crop; the
+second remains held through provider deletion, direct-read plus prefix-list
+absence confirmation, and receipt confirmation. The helpers read no
+environment, credentials, clock, or legal-hold state; hosts supply those
+boundaries and must re-evaluate eligibility/version on every retry.
+
+`resolveDisposedAt` runs after deletion and both absence checks succeed,
+immediately before each receipt-creation attempt. Its only context fields are
+`tenantId`, a detached checkpoint clone, `attemptId`, `dispositionId`, and
+`policyFence`. Receipt persistence can fail after resolution, so a retry may
+invoke the callback again with the same exact context. The host must durably
+return the same exact UTC-millisecond instant for that context; otherwise one
+provider disposal could produce conflicting receipts. Rejection or malformed
+output fails closed without persisting a receipt. Delete and absence failures
+never invoke it. A cold replay with an already accepted disposition verifies
+and returns the stored receipt byte-for-byte without invoking the callback.
+
+Hosts can gate the installed public package identities and retention behavior
+without reading package files or environment variables:
+
+```ts
+import { VERITIO_CORE_VERSION } from "@veritio/core/version";
+import {
+  RETENTION_COORDINATOR_CAPABILITY,
+  type RetentionDisposedAtResolver,
+} from "@veritio/storage/retention";
+import { VERITIO_STORAGE_VERSION } from "@veritio/storage/version";
+
+if (
+  VERITIO_CORE_VERSION !== "0.4.8" ||
+  VERITIO_STORAGE_VERSION !== "0.4.8" ||
+  !RETENTION_COORDINATOR_CAPABILITY.resolvesDisposedAtAfterConfirmedAbsence ||
+  !RETENTION_COORDINATOR_CAPABILITY.requiresAttemptIdempotentDisposedAtResolver ||
+  !RETENTION_COORDINATOR_CAPABILITY.mayReinvokeDisposedAtAfterReceiptPersistenceFailure ||
+  !RETENTION_COORDINATOR_CAPABILITY.replaysAcceptedDispositionWithoutResolvingDisposedAt
+) {
+  throw new Error("unsupported Veritio retention coordinator");
+}
+
+const resolveDisposedAt: RetentionDisposedAtResolver = async (
+  { tenantId, checkpoint, attemptId, dispositionId, policyFence },
+) => durableDispositionTimes.resolveOrCreate(
+  { tenantId, checkpointHash: checkpoint.hash, attemptId, dispositionId, policyFence },
+  () => trustedHostClock.nowUtcMilliseconds(),
+);
+```
+
+Cold retries inspect authoritative checkpoints and accepted dispositions before
+deriving anything from audit records. When a stored checkpoint has no receipt,
+the coordinator loads the deterministic epoch manifest and validates its full
+checkpoint binding before deleting its exact keys. If deletion already removed
+the manifest, confirmation requires both a direct manifest GET miss and an
+empty LIST of the complete deterministic epoch prefix; a missing manifest alone
+is insufficient. A retry with neither a stored checkpoint nor record bodies
+fails closed. `RunRetentionEpochResult.manifest` is `null` only when recovery
+confirmed a manifestless post-delete epoch from that checkpoint prefix.
+
+R2/S3 (and MinIO-compatible clients) are never authoritative: they cannot own
+sequences, idempotency, verification, DSAR answers, or a restore path. A
+checkpoint and its disposition receipt attest to a verified anchor and a
+provider-delete attempt. They do **not** prove that every provider replica or
+backup has been erased, and, after disposal, Veritio has no epoch event bodies
+available for replay. The receipt is deliberately minimal: it omits event
+bodies/metadata, legal-hold rationale, user identity, bucket keys, and raw
+provider responses; hosts keep operational evidence in their own
+access-controlled audit systems.
+
 ## Transactional Outbox
 
 The storage package exports the public outbox contract used by governed-change
@@ -180,6 +328,11 @@ describe("postgres live AuditStore conformance", () => {
 The host harness owns database clients, credentials, connection strings, test
 containers, and cleanup. Keep environment-variable reads in the test bootstrap
 or CI setup, not in `storage/src`.
+
+`createRetentionStoreConformanceTests` adds crop-boundary, retained-tip,
+idempotency-tombstone, policy-fence, and unique-disposition coverage for every
+authoritative `CheckpointingAuditStore`. Run it against the actual database;
+unit-only success cannot validate transactional retention semantics.
 
 ## External DB Checks
 

@@ -118,6 +118,75 @@ verifyAuditRecords(tampered); // { ok: false, index: 0, reason: "hash_mismatch" 
 edges. See `examples/verify-tamper-detection` for every tamper class
 (edit / delete / reorder / manifest swap) exercised end to end.
 
+## Audit Retention Checkpoints
+
+The portable retention helpers construct and verify immutable, audit-only
+checkpoints and provider-delete dispositions. They do not choose eligibility,
+read the clock, generate ids, call a provider, or read environment variables;
+the host owns those decisions. `verifyAuditRecords` remains genesis-only. Use
+`verifyAuditRecordsFromCheckpoint` only for a retained audit tail following a
+verified checkpoint.
+
+```ts
+import {
+  type AuditRecord,
+  createRetentionCheckpoint,
+  createRetentionDisposition,
+  verifyAuditRecordsFromCheckpoint,
+  verifyRetentionCheckpointChain,
+  verifyRetentionDisposition,
+} from "@veritio/core";
+
+// Fetch only the current hot tail from the authoritative checkpointing store.
+const retainedAuditRecords: AuditRecord[] = [];
+
+const checkpoint = createRetentionCheckpoint({
+  checkpointId: "rcp_org_123_1",
+  tenantId: "org_123",
+  chainKind: "audit",
+  epoch: 1,
+  fromSequence: 1,
+  fromPreviousHash: null,
+  throughSequence: 1000,
+  throughHash: "a".repeat(64),
+  recordCount: 1000,
+  archiveRootHash: "b".repeat(64),
+  previousCheckpointHash: null,
+  createdAt: "2026-08-24T00:00:00.000Z",
+});
+
+verifyRetentionCheckpointChain([checkpoint]);
+verifyAuditRecordsFromCheckpoint(checkpoint, retainedAuditRecords);
+
+const receipt = createRetentionDisposition({
+  dispositionId: "rdp_org_123_1",
+  tenantId: "org_123",
+  chainKind: "audit",
+  checkpointHash: checkpoint.hash,
+  fromSequence: checkpoint.fromSequence,
+  throughSequence: checkpoint.throughSequence,
+  archiveRootHash: checkpoint.archiveRootHash,
+  policyReference: "retention-policy-v1",
+  disposedAt: "2026-08-24T00:05:00.000Z",
+});
+verifyRetentionDisposition(receipt, checkpoint);
+```
+
+These helpers are byte-compatible with Python and Go. Optional detached
+Ed25519 verification uses caller-supplied trust material and verifier; requesting
+a signature fails closed when it is absent or cannot be verified.
+
+After disposal, a checkpoint chain and receipt provide a tamper-evident audit
+trail of the anchor and disposal attempt. They do not prove deletion from every
+replica or backup, and they cannot replay the disposed epoch's event bodies.
+Evidence edges and `EvidenceCommit` are non-capable in v1 and retain their
+genesis/full-chain semantics.
+
+Checkpoint-aware exports use `vevb-2`: they carry the full checkpoint chain
+and the complete retained audit tail. Existing `vevb-1` behavior and bytes are
+unchanged; it does not acquire checkpoint semantics by default. A v2 export
+does not reconstruct expired content from a derived archive.
+
 ## Evidence Commits
 
 `createEvidenceCommit` binds already-persisted records into an ordered Merkle
@@ -292,7 +361,7 @@ value ever entering evidence. See `docs/integrations.md` and the
 ## Cross-Language Parity
 
 Event creation, redaction, canonical JSON, record hashing, evidence commits
-(`verifyEvidenceCommits`), risk scoring, `security.risk` assertion builders,
+(`verifyEvidenceCommits`), retention checkpoints/dispositions, risk scoring, `security.risk` assertion builders,
 and the audit templates are byte-compatible across the TypeScript, Python, and
 Go SDKs, pinned by `spec/conformance` fixtures. `MemoryAuditStore`,
 `verifyAuditRecords` / `verifyEvidenceEdgeRecords`, and the provenance recorder

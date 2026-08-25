@@ -34,3 +34,6 @@ examples/gin-governed-crud/gin-governed-crud
 # Generated reports/artifacts — never committed (prevents accidental git add -A of
 # ad-hoc HTML reports, cf. the PR #36 exposure)
 /outputs/
+
+# Isolated implementation worktrees
+.worktrees/

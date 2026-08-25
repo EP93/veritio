@@ -1,0 +1,35 @@
+{
+  "cases": [
+    {
+      "name": "signed-provider-delete",
+      "input": {
+        "dispositionId": "rdp_001",
+        "tenantId": "org_fixture",
+        "chainKind": "audit",
+        "checkpointHash": "673dc45f77a9358388150de8c8525794dd9e72e5bd4e02fc648cb62e6df91dfb",
+        "fromSequence": 1,
+        "throughSequence": 2,
+        "archiveRootHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "policyReference": "policy:retention.v1",
+        "disposedAt": "2026-08-24T00:10:00.000Z",
+        "signaturePublicKeyFingerprint": "85738febb9b65976ce362021ac8b8a2d1e7854d64bfbd5af4b68a1c6b4c4bb14"
+      },
+      "signature": {
+        "algorithm": "ed25519",
+        "publicKeyFingerprint": "85738febb9b65976ce362021ac8b8a2d1e7854d64bfbd5af4b68a1c6b4c4bb14",
+        "signature": "MmG9svL7pD7Hss8fsibGkdrp0iRKBq5EHV8XfgKn7qCE0Odh/OL8xPnghl9zdYkEAZZ3bt45P5dOj/wVDLczCg=="
+      },
+      "expectedHash": "919a2ef422e2e111f46833b3cdad7d256ed33db9a304d5fc02c0afec791afa47"
+    }
+  ],
+  "mismatchRejections": [
+    { "name": "checkpoint-hash", "field": "checkpointHash", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+    { "name": "archive-root", "field": "archiveRootHash", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
+  ],
+  "signatureConstructorRejections": [
+    {
+      "name": "signature-fingerprint-does-not-match-bound-fingerprint",
+      "publicKeyFingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ]
+}

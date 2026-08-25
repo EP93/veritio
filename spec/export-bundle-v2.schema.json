@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://getveritio.com/spec/export-bundle-v2.schema.json",
+  "title": "Veritio Evidence Export Bundle v2 (vevb-2)",
+  "description": "Checkpoint-aware export of an explicit audit origin, a complete retained tail, the full evidence-edge chain, and no EvidenceCommit records.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["bundleVersion", "manifest", "files"],
+  "properties": {
+    "bundleVersion": { "const": "vevb-2" },
+    "manifest": { "$ref": "#/$defs/manifest" },
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "records/audit-events.jsonl",
+        "records/evidence-edges.jsonl",
+        "records/commits.jsonl",
+        "records/retention-checkpoints.jsonl",
+        "records/retention-dispositions.jsonl",
+        "verification.json"
+      ],
+      "properties": {
+        "records/audit-events.jsonl": { "type": "string" },
+        "records/evidence-edges.jsonl": { "type": "string" },
+        "records/commits.jsonl": { "const": "" },
+        "records/retention-checkpoints.jsonl": { "type": "string" },
+        "records/retention-dispositions.jsonl": { "type": "string" },
+        "verification.json": { "type": "string" }
+      }
+    },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time", "pattern": "^(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29|(?!0000)[0-9]{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12][0-9]|3[01])|(?:0[469]|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$" },
+    "genesisOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": { "kind": { "const": "genesis" } }
+    },
+    "checkpointOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "checkpointHash"],
+      "properties": {
+        "kind": { "const": "checkpoint" },
+        "checkpointHash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundleVersion", "createdAt", "scope", "range", "producer", "chainClaims", "files", "rootHash"],
+      "properties": {
+        "bundleVersion": { "const": "vevb-2" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tenantId"],
+          "properties": {
+            "tenantId": { "type": "string", "minLength": 1 },
+            "workspaceId": { "type": "string", "minLength": 1 },
+            "environment": { "type": "string", "minLength": 1 }
+          }
+        },
+        "range": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to"],
+          "properties": {
+            "from": { "$ref": "#/$defs/timestamp" },
+            "to": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        "producer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authority", "kind", "type", "id"],
+          "properties": {
+            "authority": { "type": "string", "minLength": 1 },
+            "kind": { "const": "principal" },
+            "type": { "enum": ["service", "user"] },
+            "id": { "type": "string", "minLength": 1 }
+          }
+        },
+        "chainClaims": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["audit", "evidenceEdges", "evidenceCommits"],
+          "properties": {
+            "audit": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["origin", "completeness"],
+                  "properties": {
+                    "origin": { "$ref": "#/$defs/genesisOrigin" },
+                    "completeness": { "const": "full" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["origin", "completeness"],
+                  "properties": {
+                    "origin": { "$ref": "#/$defs/checkpointOrigin" },
+                    "completeness": { "const": "complete-retained-tail" }
+                  }
+                }
+              ]
+            },
+            "evidenceEdges": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["origin", "completeness"],
+              "properties": {
+                "origin": { "$ref": "#/$defs/genesisOrigin" },
+                "completeness": { "const": "full" }
+              }
+            },
+            "evidenceCommits": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["origin", "completeness"],
+              "properties": {
+                "origin": { "$ref": "#/$defs/genesisOrigin" },
+                "completeness": { "const": "empty" }
+              }
+            }
+          }
+        },
+        "files": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "records", "bytes"],
+            "properties": {
+              "path": {
+                "enum": [
+                  "records/audit-events.jsonl",
+                  "records/evidence-edges.jsonl",
+                  "records/commits.jsonl",
+                  "records/retention-checkpoints.jsonl",
+                  "records/retention-dispositions.jsonl",
+                  "verification.json"
+                ]
+              },
+              "sha256": { "$ref": "#/$defs/sha256" },
+              "records": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+              "bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            }
+          },
+          "allOf": [
+            { "contains": { "properties": { "path": { "const": "records/audit-events.jsonl" } }, "required": ["path"] }, "minContains": 1, "maxContains": 1 },
+            { "contains": { "properties": { "path": { "const": "records/evidence-edges.jsonl" } }, "required": ["path"] }, "minContains": 1, "maxContains": 1 },
+            { "contains": { "properties": { "path": { "const": "records/commits.jsonl" } }, "required": ["path"] }, "minContains": 1, "maxContains": 1 },
+            { "contains": { "properties": { "path": { "const": "records/retention-checkpoints.jsonl" } }, "required": ["path"] }, "minContains": 1, "maxContains": 1 },
+            { "contains": { "properties": { "path": { "const": "records/retention-dispositions.jsonl" } }, "required": ["path"] }, "minContains": 1, "maxContains": 1 },
+            { "contains": { "properties": { "path": { "const": "verification.json" }, "records": { "const": 0 } }, "required": ["path", "records"] }, "minContains": 1, "maxContains": 1 }
+          ]
+        },
+        "rootHash": { "$ref": "#/$defs/sha256" },
+        "signaturePublicKeyFingerprint": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "publicKeyFingerprint", "signature"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "publicKeyFingerprint": { "$ref": "#/$defs/sha256" },
+        "signature": { "type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$" }
+      }
+    }
+  }
+}

@@ -22,6 +22,51 @@ event, err := veritio.CreateAuditEvent(veritio.AuditEventInput{
 hash, err := veritio.HashAuditEvent(event, nil) // previous hash chains records
 ```
 
+## Audit Retention Checkpoints
+
+The Go SDK provides the same portable, audit-only checkpoint/disposition
+helpers as TypeScript and Python. The caller provides identifiers and exact UTC
+millisecond times; core does not read clocks, environment, providers, or
+legal-hold state. Existing genesis-only audit verification is unchanged; use
+the anchored verifier for the retained tail.
+
+```go
+import (
+    "fmt"
+    "strings"
+
+    veritio "github.com/getveritio/veritio/sdks/go"
+)
+
+func verifyRetainedTail(retainedAuditRecords []veritio.AuditRecord) error {
+    checkpoint, err := veritio.CreateRetentionCheckpoint(veritio.RetentionCheckpointInput{
+        CheckpointID: "rcp_org_123_1", TenantID: "org_123", ChainKind: "audit",
+        Epoch: 1, FromSequence: 1, ThroughSequence: 1000,
+        ThroughHash: strings.Repeat("a", 64), RecordCount: 1000,
+        ArchiveRootHash: strings.Repeat("b", 64),
+        CreatedAt: "2026-08-24T00:00:00.000Z",
+    }, nil)
+    if err != nil { return err }
+
+    if result := veritio.VerifyRetentionCheckpointChain([]veritio.RetentionCheckpoint{checkpoint}, nil); !result.OK {
+        return fmt.Errorf("checkpoint verification failed: %s", result.Reason)
+    }
+    if result := veritio.VerifyAuditRecordsFromCheckpoint(checkpoint, retainedAuditRecords, nil); !result.OK {
+        return fmt.Errorf("tail verification failed: %s", result.Reason)
+    }
+    return nil
+}
+```
+
+Optional detached signatures are checked through caller-supplied trust and
+verification inputs, failing closed when required but unavailable. A checkpoint
+and provider-delete receipt are evidence of a verified anchor and deletion
+attempt, not proof that every provider replica or backup was erased; disposed
+epoch bodies cannot be replayed. Evidence-edge and `EvidenceCommit` retention
+are deliberately non-capable in v1. Checkpoint-aware exports are `vevb-2`
+with the full checkpoint chain and retained audit tail; existing `vevb-1`
+remains immutable and default.
+
 ## Governed Action Drafts
 
 Use `DefineEntity` + `CreateGovernedActionDraft` inside Gin handlers, service

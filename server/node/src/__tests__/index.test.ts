@@ -480,6 +480,80 @@ describe("Workbench HTTP app", () => {
 });
 
 describe("MCP JSON-RPC handler", () => {
+  test("create_export_bundle selects vevb-2 only from injected checkpoint inputs", async () => {
+    const store = new LocalEvidenceStore();
+    const fixture = await Bun.file(
+      new URL("../../../../spec/conformance/export-bundle-v2-golden.json", import.meta.url).pathname,
+    ).json();
+    const checkpointLines = fixture.bundle.files["records/retention-checkpoints.jsonl"].trim().split("\n");
+    const dispositionLines = fixture.bundle.files["records/retention-dispositions.jsonl"].trim().split("\n");
+    const exportTenantId = fixture.bundle.manifest.scope.tenantId;
+    const response = await handleMcpRequest(
+      store,
+      {
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: {
+          name: "veritio.create_export_bundle",
+          arguments: {
+            tenantId: exportTenantId,
+            createdAt: "2026-08-24T00:12:02.000Z",
+            bundleVersion: "vevb-2",
+            auditOrigin: fixture.bundle.manifest.chainClaims.audit.origin,
+            checkpoints: checkpointLines.map((line: string) => JSON.parse(line)),
+            dispositions: dispositionLines.map((line: string) => JSON.parse(line)),
+          },
+        },
+      },
+      { allowWriteTools: true },
+    );
+    expect(response.error).toBeUndefined();
+    expect(response.result.bundleVersion).toBe("vevb-2");
+    expect(response.result.verification.checks).toMatchObject({
+      checkpoints: true,
+      dispositions: true,
+      audit: true,
+      edges: true,
+      commits: true,
+    });
+    const bundle = parseExportBundle(response.result.bundle as string);
+    expect(bundle.bundleVersion).toBe("vevb-2");
+    expect((await verifyExportBundle(bundle)).valid).toBe(true);
+  });
+
+  test("create_export_bundle refuses to hide existing EvidenceCommit records in vevb-2", async () => {
+    const store = new LocalEvidenceStore();
+    await store.recordBatch({
+      commitId: "cmt_v2_rejected",
+      streamId: "str_v2_rejected",
+      events: [eventInput("evt_v2_rejected")],
+      edges: [],
+      committedAt: "2026-08-24T00:00:00.000Z",
+    });
+    const response = await handleMcpRequest(
+      store,
+      {
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: {
+          name: "veritio.create_export_bundle",
+          arguments: {
+            tenantId,
+            createdAt: "2026-08-24T00:12:02.000Z",
+            bundleVersion: "vevb-2",
+            auditOrigin: { kind: "genesis" },
+            checkpoints: [],
+            dispositions: [],
+          },
+        },
+      },
+      { allowWriteTools: true },
+    );
+    expect(response.error.message).toBe("vevb-2 requires an empty EvidenceCommit list");
+  });
+
   test("lists read tools by default and hides write tools", async () => {
     const store = new LocalEvidenceStore();
 
@@ -496,6 +570,20 @@ describe("MCP JSON-RPC handler", () => {
     expect(toolNames).toContain("veritio.preview_export_bundle");
     expect(toolNames).toContain("veritio.run_change_provenance_scenario");
     expect(toolNames).not.toContain("veritio.record_event");
+  });
+
+  test("describes the v1 default and explicit host-injected v2 export boundary", async () => {
+    const response = await handleMcpRequest(
+      new LocalEvidenceStore(),
+      { jsonrpc: "2.0", id: 10, method: "tools/list", params: {} },
+      { allowWriteTools: true },
+    );
+    const tool = response.result.tools.find(
+      (candidate: { name: string }) => candidate.name === "veritio.create_export_bundle",
+    );
+    expect(tool.description).toBe(
+      "Emit a portable, verifiable evidence export bundle: vevb-1 by default, or vevb-2 only with explicit host-injected checkpoint inputs, when write tools are enabled.",
+    );
   });
 
   test("allows write tools only when explicitly enabled", async () => {

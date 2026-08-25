@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import {
   HASH_ALGORITHM,
   buildExportBundle,
+  buildExportBundleV2,
   canonicalJson,
   createAuditEvent,
   createEvidenceCommit,
@@ -14,14 +15,17 @@ import {
   hashAuditRecord,
   hashEvidenceEdgeRecord,
   hashIdempotencyKey,
+  parseExportBundle,
   serializeExportBundle,
   verifyAuditRecords,
   verifyEvidenceCommits,
   verifyEvidenceEdgeRecords,
+  verifyExportBundle,
   type AuditEvent,
   type AuditEventInput,
   type AuditRecord,
   type AuditStoreAppendOptions,
+  type AuditOriginClaim,
   type EvidenceCommit,
   type EvidenceCommitInput,
   type EvidenceCommitVerificationResult,
@@ -143,6 +147,16 @@ export interface ExportBundlePreview {
     rules: string[];
   };
 }
+
+export type CreateExportBundleOptions =
+  | { createdAt: string; bundleVersion?: "vevb-1" }
+  | {
+      createdAt: string;
+      bundleVersion: "vevb-2";
+      auditOrigin: AuditOriginClaim;
+      checkpoints: unknown[];
+      dispositions?: unknown[];
+    };
 
 export interface ScenarioResult {
   tenantId: string;
@@ -715,22 +729,35 @@ export class LocalEvidenceStore {
   }
 
   /**
-   * Assembles a portable vevb-1 export bundle from all tenant-scoped evidence and
-   * returns its serialized single-file container. Selection mirrors
-   * {@link previewExportBundle}: tenant audit events and edges plus every local
-   * commit. `createdAt` is supplied by the caller so the build stays fully
-   * deterministic — the SDK builder never reads a clock — and the producer is this
-   * server's own service principal. The bundle is unsigned, so an offline verifier
-   * reports its signature as `absent`.
+   * Assembles the default byte-compatible vevb-1 export or an explicitly
+   * selected vevb-2 checkpoint export. V2 checkpoint/disposition records and
+   * audit origin are host inputs; the local server never infers retention state,
+   * reads a clock, or invents hosted semantics.
    */
   async createExportBundle(
     scope: EvidenceScope & { tenantId: string },
-    options: { createdAt: string },
+    options: CreateExportBundleOptions,
   ): Promise<string> {
     const tenantId = requireTenantId(scope, "scope.tenantId");
     const events = await this.listEvents({ tenantId });
     const edges = await this.listEdges({ tenantId });
     const commits = await this.listCommits();
+    if (options.bundleVersion === "vevb-2") {
+      if (commits.length !== 0) throw new TypeError("vevb-2 requires an empty EvidenceCommit list");
+      const bundle = await buildExportBundleV2({
+        scope: { tenantId },
+        range: exportBundleRange(events, edges, [], options.createdAt),
+        producer: EXPORT_BUNDLE_PRODUCER,
+        createdAt: options.createdAt,
+        auditOrigin: options.auditOrigin,
+        events,
+        edges,
+        commits: [],
+        checkpoints: options.checkpoints,
+        dispositions: options.dispositions ?? [],
+      });
+      return serializeExportBundle(bundle);
+    }
     const bundle = await buildExportBundle({
       scope: { tenantId },
       range: exportBundleRange(events, edges, commits, options.createdAt),
@@ -1580,18 +1607,46 @@ export async function handleMcpRequest(
         await store.reset();
         return rpcResult(id, { ok: true });
       case "veritio.create_export_bundle":
-        return rpcResult(id, {
-          bundle: await store.createExportBundle(
-            { tenantId: requireTenantArg(args) },
-            { createdAt: requireIsoTimestamp(args.createdAt, "createdAt") },
-          ),
-        });
+        return rpcResult(id, await createExportBundleResult(store, args));
       default:
         return rpcError(id, -32602, `Unknown MCP tool: ${name}`);
     }
   } catch (error) {
     return rpcError(id, -32000, error instanceof Error ? error.message : String(error));
   }
+}
+
+/**
+ * Selects vevb-1 or vevb-2 from explicit MCP input. Checkpoint-aware creation
+ * accepts only host-injected anchors and receipts, then returns sanitized
+ * per-chain verdicts alongside the serialized bundle; the legacy v1 response
+ * remains exactly `{ bundle }`.
+ */
+async function createExportBundleResult(
+  store: LocalEvidenceStore,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const tenantId = requireTenantArg(args);
+  const createdAt = requireIsoTimestamp(args.createdAt, "createdAt");
+  const version = args.bundleVersion ?? "vevb-1";
+  if (version === "vevb-1") {
+    return { bundle: await store.createExportBundle({ tenantId }, { createdAt }) };
+  }
+  if (version !== "vevb-2") throw new TypeError("bundleVersion must be vevb-1 or vevb-2");
+  const bundleText = await store.createExportBundle(
+    { tenantId },
+    {
+      createdAt,
+      bundleVersion: "vevb-2",
+      auditOrigin: args.auditOrigin as AuditOriginClaim,
+      checkpoints: requireArray(args.checkpoints, "checkpoints"),
+      dispositions: args.dispositions === undefined ? [] : requireArray(args.dispositions, "dispositions"),
+    },
+  );
+  const bundle = parseExportBundle(bundleText);
+  if (bundle.bundleVersion !== "vevb-2") throw new TypeError("vevb-2 selection failed");
+  const verification = await verifyExportBundle(bundle);
+  return { bundleVersion: "vevb-2", verification, bundle: bundleText };
 }
 
 /**
@@ -2033,6 +2088,12 @@ function requireString(value: unknown, field: string): string {
   return value;
 }
 
+/** Requires a host-injected protocol record list without coercion or defaults. */
+function requireArray(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) throw new TypeError(`${field} must be an array`);
+  return value;
+}
+
 const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?(Z|[+-]\d{2}:\d{2})$/;
 
 /**
@@ -2373,7 +2434,7 @@ function toolDescription(name: string): string {
     case "veritio.reset_dev_store":
       return "Clear the local development evidence store.";
     case "veritio.create_export_bundle":
-      return "Emit a portable, verifiable vevb-1 evidence export bundle when write tools are enabled.";
+      return "Emit a portable, verifiable evidence export bundle: vevb-1 by default, or vevb-2 only with explicit host-injected checkpoint inputs, when write tools are enabled.";
     default:
       return `Read local evidence through ${name}.`;
   }

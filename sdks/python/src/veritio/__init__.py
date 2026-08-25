@@ -36,6 +36,19 @@ from .risk import (
     score_risk_signals,
     with_risk_signals,
 )
+from .retention import (
+    RETENTION_CANONICALIZATION,
+    RETENTION_HASH_ALGORITHM,
+    RETENTION_SCHEMA_VERSION,
+    create_retention_checkpoint,
+    create_retention_disposition,
+    hash_retention_checkpoint,
+    hash_retention_disposition,
+    verify_audit_records_from_checkpoint,
+    verify_retention_checkpoint,
+    verify_retention_checkpoint_chain,
+    verify_retention_disposition,
+)
 from .templates import (
     activity_episode_started_template,
     agent_prompt_recorded_template,
@@ -136,4 +149,15 @@ __all__ = [
     "rollup_episode_risk",
     "score_risk_signals",
     "with_risk_signals",
+    "RETENTION_CANONICALIZATION",
+    "RETENTION_HASH_ALGORITHM",
+    "RETENTION_SCHEMA_VERSION",
+    "create_retention_checkpoint",
+    "create_retention_disposition",
+    "hash_retention_checkpoint",
+    "hash_retention_disposition",
+    "verify_audit_records_from_checkpoint",
+    "verify_retention_checkpoint",
+    "verify_retention_checkpoint_chain",
+    "verify_retention_disposition",
 ]

@@ -38,6 +38,22 @@ describe("parseVerifyBundleArgs", () => {
 });
 
 describe("runVerifyBundle", () => {
+  test("selects and reports checkpoint-aware vevb-2 verification", async () => {
+    const fixture = await Bun.file(
+      join(import.meta.dir, "../../../spec/conformance/export-bundle-v2-golden.json"),
+    ).json();
+    const file = await tempFile("bundle-v2.json", JSON.stringify(fixture.bundle));
+    const output: string[] = [];
+    const result = await runVerifyBundle(["verify-bundle", file], { write: (message) => output.push(message) });
+    expect(result.code).toBe(0);
+    expect(output.join("\n")).toContain("version: vevb-2");
+    expect(output.join("\n")).toContain("checkpoints: pass");
+    expect(output.join("\n")).toContain("dispositions: pass");
+    expect(output.join("\n")).toContain("audit: pass");
+    expect(output.join("\n")).toContain("edges: pass");
+    expect(output.join("\n")).toContain("commits: pass");
+  });
+
   test("returns 0 for a valid bundle file", async () => {
     const bundle = await buildExportBundle(buildInput);
     const file = await tempFile("bundle.json", serializeExportBundle(bundle));
